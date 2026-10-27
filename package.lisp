@@ -1,5 +1,13 @@
+;;; NEON SIMD through sb-simd is used where available (SBCL on ARM64)
+#+(and sbcl arm64)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (and (ignore-errors (require :sb-simd) t)
+             (find-package "SB-SIMD-NEON"))
+    (pushnew :cl-jpeg-neon *features*)))
+
 (defpackage #:jpeg
   (:use #:common-lisp)
+  #+cl-jpeg-neon (:local-nicknames (#:neon #:sb-simd-neon))
   (:nicknames #:cl-jpeg)
   (:export #:encode-image
 	   #:encode-image-stream

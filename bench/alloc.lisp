@@ -1,0 +1,5 @@
+(load (merge-pathnames "load.lisp" (directory-namestring *load-truename*)))
+(dolist (f (script-args))
+  (let ((bytes (file-bytes f))) (decode-mem bytes)
+    (let ((b0 (sb-ext:get-bytes-consed))) (decode-mem bytes)
+      (format t "~a consed ~,1f MB~%" (file-namestring f) (/ (- (sb-ext:get-bytes-consed) b0) 1e6)))))
