@@ -533,6 +533,10 @@
   (:report (lambda (condition stream)
 	     (format stream "Invalid JPEG data: ~A" (invalid-jpeg-data-reason condition)))))
 
+(define-condition truncated-jpeg-data (invalid-jpeg-data end-of-file)
+  ()
+  (:default-initargs :reason "unexpected end of data" :stream nil))
+
 (defmacro clamp-sample (x)
   "X clamped to 0..255"
   `(let ((v ,x))
@@ -1301,10 +1305,10 @@ before use, as the decoder is compiled without runtime checks."
   (coefs (make-array 64 :element-type '(signed-byte 32)) :type sint32-array) ; block being decoded
   (idct-ws (make-array 64 :element-type 'fixnum) :type fixnum-array) ; IDCT workspace
   (ncomp 0 :type fixnum)
-  ;; Input: bytes SOURCE-POS below SOURCE-END of SOURCE are next. BYTE-READER
+  ;; Input: bytes SOURCE-POS below SOURCE-END of SOURCE are next. REFILL
   ;; refills SOURCE and returns the new end, or 0 when there is no more data.
-  (byte-reader #'(lambda () ;in case setup fails somehow
-		   (error 'jpeg-decoder-error)) :type function)
+  (byte-reader nil)         ; user-supplied function returning the next input byte
+  (refill (lambda () 0) :type function)
   (source (make-array 0 :element-type 'uint8) :type uint8-array)
   (source-pos 0 :type fixnum)
   (source-end 0 :type fixnum)
@@ -1330,6 +1334,15 @@ before use, as the decoder is compiled without runtime checks."
   (vmax 1 :type fixnum)
   (mcus-x 0 :type fixnum)   ; MCUs per row and column
   (mcus-y 0 :type fixnum))
+
+(defun read-jpeg-byte (image)
+  (declare #.*optimize*)
+  (let ((pos (descriptor-source-pos image)))
+    (declare (type fixnum pos))
+    (when (>= pos (descriptor-source-end image))
+      (setf pos (refill-source image)))
+    (setf (descriptor-source-pos image) (1+ pos))
+    (aref (descriptor-source image) pos)))
 
 (defun read-frame-components (image)
   "Reads the component specifications of the frame header and sets up the
@@ -1419,27 +1432,19 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
                             (descriptor-vmax image))
                    8)))
 
-(defun read-jpeg-byte (image)
-  (declare #.*optimize*)
-  (let ((pos (descriptor-source-pos image)))
-    (declare (type fixnum pos))
-    (when (>= pos (descriptor-source-end image))
-      (setf pos (refill-source image)))
-    (setf (descriptor-source-pos image) (1+ pos))
-    (aref (descriptor-source image) pos)))
-
 (defun refill-source (image)
   "Refills the input buffer and returns the position of its first byte"
-  (let ((end (funcall (descriptor-byte-reader image))))
+  (let ((end (funcall (descriptor-refill image))))
     (declare (type fixnum end))
     (when (zerop end)
-      (error 'end-of-file :stream nil))
+      (error 'truncated-jpeg-data))
     (setf (descriptor-source-end image) end
           (descriptor-source-pos image) 0)))
 
 (defun set-source (image stream cached-source-p)
-  "Sets up the input of IMAGE: the source cache, a file stream read in
-chunks, or another stream read byte by byte"
+  "Sets up the input of IMAGE: the source cache, the descriptor's byte reader
+if one was supplied, a file stream read in chunks, or another stream read byte
+by byte"
   (cond (cached-source-p
          (when (or (not (typep (descriptor-source-cache image) 'uint8-array))
                    (and (typep stream 'file-stream)
@@ -1449,7 +1454,14 @@ chunks, or another stream read byte by byte"
            (read-sequence (descriptor-source-cache image) stream))
          (setf (descriptor-source image) (descriptor-source-cache image)
                (descriptor-source-end image) (length (descriptor-source-cache image))
-               (descriptor-byte-reader image) (lambda () 0)))
+               (descriptor-refill image) (lambda () 0)))
+        ((descriptor-byte-reader image)
+         (let ((buffer (make-array 1 :element-type 'uint8))
+               (reader (descriptor-byte-reader image)))
+           (setf (descriptor-source image) buffer
+                 (descriptor-source-end image) 0
+                 (descriptor-refill image)
+                 (lambda () (setf (aref buffer 0) (funcall reader)) 1))))
         ;; Seekable streams are read in chunks; RELEASE-SOURCE moves the
         ;; position back to just after the data used
         ((and (typep stream 'file-stream) (file-position stream))
@@ -1458,12 +1470,12 @@ chunks, or another stream read byte by byte"
          (let ((buffer (descriptor-stream-buffer image)))
            (setf (descriptor-source image) buffer
                  (descriptor-source-end image) 0
-                 (descriptor-byte-reader image) (lambda () (read-sequence buffer stream)))))
+                 (descriptor-refill image) (lambda () (read-sequence buffer stream)))))
         (t
          (let ((buffer (make-array 1 :element-type 'uint8)))
            (setf (descriptor-source image) buffer
                  (descriptor-source-end image) 0
-                 (descriptor-byte-reader image)
+                 (descriptor-refill image)
                  (lambda () (setf (aref buffer 0) (read-byte stream)) 1)))))
   (setf (descriptor-source-pos image) 0))
 
@@ -2338,23 +2350,6 @@ called with the band (MCU row) index whenever the last block of a band is done."
                 (when (and band-done (= mcu-x (1- mcus-x)))
                   (funcall (the function band-done) mcu-y)))))))
 
-(defun interval-end (image scan total-units)
-  "Returns the end of the restart interval starting at the current data unit"
-  (let ((ri (descriptor-restart-interval image)))
-    (if (zerop ri) total-units (min total-units (+ (scan-x scan) ri)))))
-
-(defun chunk-result (scan br total-units)
-  "Returns what DECODE-SCAN-INTERVALS expects from a chunk decoder: :RESTART (or
-:RESTART-READ, if the RSTn marker was already consumed) when an interval ended
-with more data units left in the scan, otherwise NIL or the marker that the
-bit reader met"
-  ;; The bit reader may have read ahead into the marker that follows
-  (let ((marker (bitreader-marker br)))
-    (cond ((>= (scan-x scan) total-units) marker)
-          ((eq marker 'restart) :restart-read)
-          (marker)
-          (t :restart))))
-
 (defun read-scan-header (image)
   "Reads a SOS header, returning the new scan"
   (let ((scan (make-scan)))
@@ -2375,35 +2370,30 @@ bit reader met"
       (setf (scan-al scan) (logand ahal 15)))
     scan))
 
-(defun decode-scan-intervals (image scan chunk-decoder)
-  "Decodes SCAN by calling CHUNK-DECODER for each restart interval. Returns the
-marker that terminated the scan, or 0 if it ended cleanly."
-  ;; Progressive data units may consume no bits at all (EOB runs) or a
-  ;; single bit (DC refinement), so restart intervals can't be delimited by
-  ;; waiting for the bit reader to hit a marker: data units are counted instead.
-  (let ((ri (descriptor-restart-interval image)))
-    (loop for term = (funcall chunk-decoder) do
-          (case term
-            ((nil) (return 0))
-            (:restart-read)
-            ;; Interval completed: consume its RSTn marker
-            (:restart
-             (let ((mk (read-marker image)))
-               (unless (<= +M_RST0+ mk +M_RST7+)
-                 (return mk))))
-            ;; Bit reader ran into RSTn early (corrupt data): resync at the
-            ;; start of the next interval
-            (restart
-             (if (zerop ri)
-                 (return 0)
-                 (setf (scan-x scan) (* (1+ (floor (scan-x scan) ri)) ri))))
-            (t (return term))))))
+(defstruct (scan-cursor (:constructor make-scan-cursor
+                            (scan comps total-units tables restart-interval pos)))
+  "A scan being decoded, possibly in several calls: its header and restart
+interval, and the decoder state carried between calls"
+  scan
+  (comps nil :type (simple-array fixnum (*)))
+  (total-units 0 :type fixnum)
+  (tables #() :type simple-vector)  ; Huffman table of each scan component
+  (restart-interval 0 :type fixnum)
+  (data nil :type (or null uint8-array)) ; holds the scan's data; NIL: read the input directly
+  (pos 0 :type fixnum)              ; next byte of the scan's data in DATA
+  (end 0 :type fixnum)              ; end of the data in DATA
+  (br (make-bitreader) :type bitreader)
+  (preds (make-array 4 :element-type 'sint16 :initial-element 0) :type (simple-array sint16 (*)))
+  (eobrun 0 :type fixnum)
+  (done nil)                        ; t once the scan's data has run out
+  (marker nil))                     ; marker that ended the scan's data early, if any
 
-;;; Reads and decodes either whole scan or restart interval
-(defun decode-chunk (image scan comps total-units dc-tables ac-tables dequant limits)
-  "Decodes one restart interval of a sequential scan (or the whole scan) into the component planes"
-  (let ((br (make-bitreader))
-        (preds (make-array (length comps) :initial-element 0 :element-type 'sint16))
+(defun decode-sequential-units (image cursor end dc-tables ac-tables dequant limits)
+  "Decodes the data units of CURSOR's sequential scan up to END into the
+component planes, writing out each band completed when the planes are strips"
+  (let ((scan (scan-cursor-scan cursor))
+        (br (scan-cursor-br cursor))
+        (preds (scan-cursor-preds cursor))
         (block (descriptor-coefs image))
         (ws (descriptor-idct-ws image))
         (planes (descriptor-planes image))
@@ -2435,11 +2425,9 @@ marker that terminated the scan, or 0 if it ended cleanly."
            (band-done (band)
              (output-band image band)))
       (declare (dynamic-extent #'decode-one #'band-done))
-      (fill block 0) ; a marker may have interrupted the previous interval mid-block
-      (catch 'marker
-        (map-scan-blocks image scan comps (scan-x scan) (interval-end image scan total-units)
-                         #'decode-one (when strip #'band-done))
-        (chunk-result scan br total-units)))))
+      (fill block 0) ; a marker may have interrupted the previous call mid-block
+      (map-scan-blocks image scan (scan-cursor-comps cursor) (scan-x scan) end
+                       #'decode-one (when strip #'band-done)))))
 
 ;;; ============================================================
 ;;; Progressive JPEG decoding functions
@@ -2588,21 +2576,6 @@ marker that terminated the scan, or 0 if it ended cleanly."
 ;;; resuming each scan's decoder where the previous band left it. Only one
 ;;; band of coefficients is held instead of the whole image.
 
-(defstruct (scan-cursor (:constructor make-scan-cursor
-                            (scan comps total-units tables restart-interval pos)))
-  "A progressive scan being decoded band by band"
-  scan
-  (comps nil :type (simple-array fixnum (*)))
-  (total-units 0 :type fixnum)
-  (tables #() :type simple-vector)  ; Huffman table of each scan component
-  (restart-interval 0 :type fixnum)
-  (data (make-array 0 :element-type 'uint8) :type uint8-array) ; holds the entropy-coded data
-  (pos 0 :type fixnum)              ; next byte of the scan's data in DATA
-  (end 0 :type fixnum)              ; end of the data in DATA
-  (br (make-bitreader) :type bitreader)
-  (preds (make-array 4 :element-type 'sint16 :initial-element 0) :type (simple-array sint16 (*)))
-  (eobrun 0 :type fixnum)
-  (done nil))                       ; t once the scan's data has run out
 
 (defun skip-entropy-data (image)
   "Moves past entropy-coded data (and RSTn markers) in the input, returning the
@@ -2783,36 +2756,55 @@ buffers of BAND."
       (map-scan-blocks image scan (scan-cursor-comps cursor) (scan-x scan) end #'decode-one)
       (setf (scan-cursor-eobrun cursor) eobrun))))
 
-(defun advance-cursor (image cursor band)
-  "Decodes the data units of CURSOR's scan that lie in BAND"
+(defun advance-cursor (image cursor end decode-units)
+  "Decodes the data units of CURSOR's scan up to END by calling DECODE-UNITS
+with the end of each stretch lying within one restart interval, and handles the
+RSTn markers between intervals."
+  ;; Progressive data units may consume no bits at all (EOB runs) or a single
+  ;; bit (DC refinement), so intervals are delimited by counting data units
+  ;; rather than by waiting for the bit reader to meet a marker.
   (let ((scan (scan-cursor-scan cursor))
         (ri (scan-cursor-restart-interval cursor))
-        (end (scan-band-end image cursor band)))
-    ;; the scan's data becomes the input while decoding it
-    (setf (descriptor-source image) (scan-cursor-data cursor)
-          (descriptor-source-pos image) (scan-cursor-pos cursor)
-          (descriptor-source-end image) (scan-cursor-end cursor)
-          (descriptor-byte-reader image) (lambda () 0))
+        (data (scan-cursor-data cursor)))
+    (declare (type function decode-units))
+    (when data ; the scan's data becomes the input while decoding it
+      (setf (descriptor-source image) data
+            (descriptor-source-pos image) (scan-cursor-pos cursor)
+            (descriptor-source-end image) (scan-cursor-end cursor)
+            (descriptor-refill image) (lambda () 0)))
     (loop until (or (scan-cursor-done cursor) (>= (scan-x scan) end)) do
           (let* ((stop (if (zerop ri) end (min end (* (1+ (floor (scan-x scan) ri)) ri))))
                  (result (catch 'marker
-                           (decode-scan-units image cursor band stop)
+                           (funcall decode-units stop)
                            :done)))
             (cond ((eq result :done)
                    ;; at the end of a restart interval, consume its RSTn marker
+                   ;; (unless the bit reader already has)
                    (when (and (plusp ri) (zerop (mod (scan-x scan) ri))
                               (< (scan-x scan) (scan-cursor-total-units cursor)))
                      (unless (eq (bitreader-marker (scan-cursor-br cursor)) 'restart)
-                       (unless (<= +M_RST0+ (read-marker image) +M_RST7+)
-                         (setf (scan-cursor-done cursor) t)))
+                       (let ((marker (read-marker image)))
+                         (unless (<= +M_RST0+ marker +M_RST7+)
+                           (setf (scan-cursor-done cursor) t
+                                 (scan-cursor-marker cursor) marker))))
                      (reset-cursor cursor)))
                   ((and (eq result 'restart) (plusp ri))
                    ;; RSTn met early (corrupt data): resync at the next interval
                    (setf (scan-x scan) (* (1+ (floor (scan-x scan) ri)) ri))
                    (reset-cursor cursor))
                   (t ; the scan's data ended early
-                   (setf (scan-cursor-done cursor) t)))))
-    (setf (scan-cursor-pos cursor) (descriptor-source-pos image))))
+                   (setf (scan-cursor-done cursor) t
+                         (scan-cursor-marker cursor) (and (integerp result) result))))))
+    (when data
+      (setf (scan-cursor-pos cursor) (descriptor-source-pos image)))))
+
+(defun scan-end-marker (cursor)
+  "Returns the marker that followed the data of CURSOR's scan if it has been
+read already (by the bit reader reading ahead, or at an early end), else 0"
+  (or (scan-cursor-marker cursor)
+      (let ((marker (bitreader-marker (scan-cursor-br cursor))))
+        (and (integerp marker) marker))
+      0))
 
 (defun finalize-band (image band dequant)
   "Dequantizes and inverse transforms the coefficients of BAND into the strip
@@ -2858,20 +2850,22 @@ planes, and clears them for the next band."
          (source (descriptor-source image))
          (source-pos (descriptor-source-pos image))
          (source-end (descriptor-source-end image))
-         (reader (descriptor-byte-reader image))
+         (refill (descriptor-refill image))
          (dequant (coerce (loop for c below (descriptor-ncomp image) collect (dequant-table image c))
                           'simple-vector)))
     (allocate-coef-buffers image)
     (allocate-planes image t)
     (dotimes (band (descriptor-mcus-y image))
       (dolist (cursor cursors)
-        (advance-cursor image cursor band))
+        (flet ((decode-units (end) (decode-scan-units image cursor band end)))
+          (declare (dynamic-extent #'decode-units))
+          (advance-cursor image cursor (scan-band-end image cursor band) #'decode-units)))
       (finalize-band image band dequant)
       (output-band image band))
     (setf (descriptor-source image) source
           (descriptor-source-pos image) source-pos
           (descriptor-source-end image) source-end
-          (descriptor-byte-reader image) reader)))
+          (descriptor-refill image) refill)))
 
 ;;; Scan decoding subroutine
 (defun decode-scan (image)
@@ -2890,9 +2884,12 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
       ;; A scan of all components is the only scan of a sequential frame, so it
       ;; can be decoded and output one band at a time
       (allocate-planes image (= (length comps) (descriptor-ncomp image))))
-    (decode-scan-intervals image scan
-                           (lambda () (decode-chunk image scan comps total-units
-                                                    dc-tables ac-tables dequant limits)))))
+    (let ((cursor (make-scan-cursor scan comps total-units #() (descriptor-restart-interval image) 0)))
+      (flet ((decode-units (end)
+               (decode-sequential-units image cursor end dc-tables ac-tables dequant limits)))
+        (declare (dynamic-extent #'decode-units))
+        (advance-cursor image cursor total-units #'decode-units))
+      (scan-end-marker cursor))))
 
 ;;; Clamps v+256 to 0..255, for v in -256..511
 (declaim (type uint8-array +clamp-table+))
@@ -3216,8 +3213,8 @@ so the samples are only valid during the call, and NIL is returned in place of
 the image array. SCALE (1, 1/2, 1/4 or 1/8) decodes a reduced image, using
 reduced inverse DCTs; the returned height and width are those of the scaled
 image, rounded up."
-  (when (and (null stream) (not cached-source-p))
-    (error 'invalid-buffer-supplied))
+  (when (and (null stream) (not cached-source-p) (not (and descriptor (descriptor-byte-reader descriptor))))
+    (error 'invalid-buffer-supplied :buffer nil))
   (check-type scale (member 1 1/2 1/4 1/8))
   (let ((image (or descriptor (make-descriptor))))
     (setf (descriptor-block-size image) (* 8 scale))
