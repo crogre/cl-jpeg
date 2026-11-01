@@ -14,8 +14,20 @@ tools in this directory and must keep all correctness checks passing:
 - speed: `run.sh <label>`; memory: `alloc.lisp` (cl-jpeg) and `stb_mem`
 
 Experiments are done one after the other in this session (they all
-touch the same hot code, so parallel work would conflict), and each
-ends with a commit and an entry below.
+touch the same hot code, so parallel work would conflict).
+
+Branches, for comparing implementations afterwards:
+
+| experiment | branch | based on |
+|---|---|---|
+| 1. MCU rows | `exp/1-mcu-rows` | `eab3e29` |
+| 2. input + Huffman | `exp/2-input-huffman` | `eab3e29` |
+| 3. sparse IDCT | `exp/3-sparse-idct` | `eab3e29` |
+| 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-row output) |
+| 5. optional features | `exp/5-*` | decided later |
+
+Experiment branches hold only code; this worklog and the results live
+on `low-memory-experiments`.
 
 ## Reference (b3fc122, 2048x2048 unless noted)
 
