@@ -32,3 +32,18 @@
       (incf bad)
       (when (< bad 3) (format t "mismatch: ~a~% scalar ~a~% idct   ~a~%" block (subseq p1 8 16) (subseq p2 8 16)))))
   (format t "~d random blocks, ~d mismatches~%" n bad))
+
+;;; The NEON 4x4 reduced IDCT against the scalar one, where both exist
+(when (fboundp 'idct-4x4-neon)
+  (let ((bad 0) (n 200000)
+        (block (make-array 64 :element-type '(signed-byte 32)))
+        (ws (make-array 64 :element-type 'fixnum))
+        (p1 (make-array 256 :element-type 'uint8))
+        (p2 (make-array 256 :element-type 'uint8)))
+    (dotimes (i n)
+      (fill block 0)
+      (dotimes (u 4) (dotimes (v 4) (setf (aref block (+ (* u 8) v)) (- (random 4095) 2047))))
+      (idct-4x4-scalar block ws p1 4 16)
+      (funcall 'idct-4x4-neon block p2 4 16)
+      (unless (equalp p1 p2) (incf bad)))
+    (format t "~d random blocks, ~d mismatches (NEON vs scalar 4x4)~%" n bad)))

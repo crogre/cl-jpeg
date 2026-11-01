@@ -2186,8 +2186,68 @@ in PLANE at POS, rows STRIDE apart" n)
                                                (if (logtest s -256) (if (minusp s) 0 255) s)))))
          nil))))
 
-(define-reduced-idct idct-4x4 4)
+(define-reduced-idct idct-4x4-scalar 4)
 (define-reduced-idct idct-2x2 2)
+
+#+cl-jpeg-neon
+(defmacro define-neon-idct-4x4 (name)
+  "Defines NAME as IDCT-4X4-SCALAR done with NEON: each coefficient row is one
+vector, so each pass is 16 vector multiply-adds, with 4x4 transpositions
+between and after them"
+  (let ((table (scaled-idct-table 4)))
+    (labels ((dot (coefs vectors)
+               ;; sum of constant times vector
+               (reduce (lambda (a b) `(neon:s32.4+ ,a ,b))
+                       (mapcar (lambda (k v) `(neon:s32.4* ,v (neon:s32.4-broadcast ,k))) coefs vectors)))
+             (row (x) (loop for u below 4 collect (aref table (+ (* x 4) u)))))
+      `(defun ,name (block plane pos stride)
+         "Inverse transforms the top left 4x4 coefficients of BLOCK into 4x4 samples
+in PLANE at POS, rows STRIDE apart"
+         (declare #.*optimize*
+                  (type sint32-array block)
+                  (type uint8-array plane)
+                  (type fixnum pos stride))
+         (flet ((transpose4 (r0 r1 r2 r3)
+                  (let ((t0 (neon:s64.2! (neon:s32.4-transpose-even r0 r1)))
+                        (t1 (neon:s64.2! (neon:s32.4-transpose-odd r0 r1)))
+                        (t2 (neon:s64.2! (neon:s32.4-transpose-even r2 r3)))
+                        (t3 (neon:s64.2! (neon:s32.4-transpose-odd r2 r3))))
+                    (values (neon:s32.4! (neon:s64.2-transpose-even t0 t2))
+                            (neon:s32.4! (neon:s64.2-transpose-even t1 t3))
+                            (neon:s32.4! (neon:s64.2-transpose-odd t0 t2))
+                            (neon:s32.4! (neon:s64.2-transpose-odd t1 t3))))))
+           (declare (inline transpose4))
+           (let ((r0 (neon:s32.4-aref block 0)) (r1 (neon:s32.4-aref block 8))
+                 (r2 (neon:s32.4-aref block 16)) (r3 (neon:s32.4-aref block 24))
+                 (pass1-round (neon:s32.4-broadcast ,(ash 1 (- dct-shift 3))))
+                 (pass2-round (neon:s32.4-broadcast ,(+ (ash 1 (+ dct-shift 1)) (ash 128 (+ dct-shift 2))))))
+             ;; columns: row X of the output from the coefficient rows, keeping 2 extra bits
+             (multiple-value-bind (c0 c1 c2 c3)
+                 (transpose4 ,@(loop for x below 4
+                                     collect `(neon:s32.4-shiftr (neon:s32.4+ ,(dot (row x) '(r0 r1 r2 r3)) pass1-round)
+                                                                 ,(- dct-shift 2))))
+               ;; rows: column Y of the output, level shifted, then back to rows
+               (multiple-value-bind (o0 o1 o2 o3)
+                   (transpose4 ,@(loop for y below 4
+                                       collect `(neon:s32.4-shiftr (neon:s32.4+ ,(dot (row y) '(c0 c1 c2 c3)) pass2-round)
+                                                                   ,(+ dct-shift 2))))
+                 (flet ((clamped (a b)
+                          (neon:u16.8! (neon:s16.8-max (neon:s16.8-broadcast 0)
+                                                       (neon:s16.8-min (neon:s16.8-broadcast 255)
+                                                                       (neon:s16.8-from-s32.4-saturating-hi
+                                                                        (neon:s16.8-from-s32.4-saturating a) b))))))
+                   (declare (inline clamped))
+                   (multiple-value-bind (s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15)
+                       (neon:u8.16-values (neon:u8.16-from-u16.8-hi (neon:u8.16-from-u16.8 (clamped o0 o1))
+                                                                    (clamped o2 o3)))
+                     ,@(loop for x below 4
+                             append (loop for y below 4
+                                          collect `(setf (aref plane (plus pos ,(if (zerop x) y `(plus (mul ,x stride) ,y))))
+                                                         ,(intern (format nil "S~D" (+ (* x 4) y)))))))))))
+           nil)))))
+
+#+cl-jpeg-neon
+(define-neon-idct-4x4 idct-4x4-neon)
 
 (defun idct-block (block ws plane pos stride last &optional (size 8))
   "Performs inverse LLM DCT on BLOCK (dequantized, natural order) and stores the
@@ -2219,7 +2279,9 @@ makes a block reduced to SIZExSIZE samples."
                  (dotimes (row size)
                    (dotimes (col size)
                      (setf (aref plane (plus pos (plus (mul row stride) col))) sample)))))))
-        ((= size 4) (idct-4x4 block ws plane pos stride))
+        ((= size 4)
+         #+cl-jpeg-neon (idct-4x4-neon block plane pos stride)
+         #-cl-jpeg-neon (idct-4x4-scalar block ws plane pos stride))
         ((= size 2) (idct-2x2 block ws plane pos stride))
         #+cl-jpeg-neon
         ((<= last 9) (neon-idct-block block plane pos stride t))
