@@ -1290,6 +1290,10 @@
   (blocks-per-row nil)      ; vector of per-component block-row counts
   (blocks-per-col nil)      ; vector of per-component block-column counts
   (planes nil)              ; vector of per-component sample planes, (* 8 blocks-per-row) wide
+  (strip-p nil)             ; t when the planes hold one MCU row (band) instead of the image
+  (next-band 0 :type fixnum) ; first band not yet written to the output buffer
+  (xmaps nil)               ; per-component output column -> plane column maps
+  (convert-p nil)           ; t when YCbCr may be converted to BGR on output
   (hmax 1 :type fixnum)     ; maximum sampling factors
   (vmax 1 :type fixnum)
   (mcus-x 0 :type fixnum)   ; MCUs per row and column
@@ -1297,7 +1301,7 @@
 
 (defun read-frame-components (image)
   "Reads the component specifications of the frame header and sets up the
-frame geometry and the component planes."
+frame geometry. The planes are allocated by ALLOCATE-PLANES."
   (let ((ncomp (descriptor-ncomp image)))
     (loop for i fixnum from 0 below ncomp
           with hv fixnum do
@@ -1311,20 +1315,40 @@ frame geometry and the component planes."
            (mcus-x (ceiling (descriptor-width image) (* hmax 8)))
            (mcus-y (ceiling (descriptor-height image) (* vmax 8)))
            (bpr (make-array ncomp))
-           (bpc (make-array ncomp))
-           (planes (make-array ncomp)))
+           (bpc (make-array ncomp)))
       (setf (descriptor-hmax image) hmax
             (descriptor-vmax image) vmax
             (descriptor-mcus-x image) mcus-x
             (descriptor-mcus-y image) mcus-y)
       (dotimes (c ncomp)
         (setf (aref bpr c) (* mcus-x (aref (descriptor-H image) c))
-              (aref bpc c) (* mcus-y (aref (descriptor-V image) c))
-              (aref planes c) (make-array (+ 16 (* 64 (aref bpr c) (aref bpc c))) ; room for 16-byte loads
-                                            :element-type 'uint8)))
+              (aref bpc c) (* mcus-y (aref (descriptor-V image) c))))
       (setf (descriptor-blocks-per-row image) bpr
             (descriptor-blocks-per-col image) bpc
-            (descriptor-planes image) planes))))
+            (descriptor-planes image) nil))))
+
+(defun allocate-planes (image strip)
+  "Allocates the component planes: one MCU row (band) high when STRIP is true,
+otherwise covering the whole image. Also prepares the output column maps."
+  (let ((ncomp (descriptor-ncomp image))
+        (planes (make-array (descriptor-ncomp image))))
+    (dotimes (c ncomp)
+      (setf (aref planes c)
+            (make-array (+ 16 (* 64 (aref (descriptor-blocks-per-row image) c) ; 16: room for 16-byte loads
+                                 (if strip
+                                     (aref (descriptor-V image) c)
+                                     (aref (descriptor-blocks-per-col image) c))))
+                        :element-type 'uint8)))
+    (setf (descriptor-planes image) planes
+          (descriptor-strip-p image) strip
+          (descriptor-next-band image) 0
+          (descriptor-xmaps image)
+          (coerce (loop for c below ncomp
+                        ;; identity maps where no resampling is needed, for the fused loop
+                        collect (or (component-xmap image c)
+                                    (let ((id (make-array (descriptor-width image) :element-type 'fixnum)))
+                                      (dotimes (x (length id) id) (setf (aref id x) x)))))
+                  'simple-vector))))
 
 (defun allocate-coef-buffers (image)
   "Allocate per-component coefficient buffers for progressive decoding."
@@ -2004,22 +2028,28 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
         (* bw bh))
       (* (descriptor-mcus-x image) (descriptor-mcus-y image))))
 
-(defun map-scan-blocks (image scan comps start end fn)
+(defun map-scan-blocks (image scan comps start end fn &optional band-done)
   "Calls FN with the scan component index, the image component index and the
 row and column of each block in data units START below END of SCAN, in decoding
-order. SCAN-X is kept as the number of data units done."
+order. SCAN-X is kept as the number of data units done. BAND-DONE, if given, is
+called with the band (MCU row) index whenever the last block of a band is done."
   (declare #.*optimize*
            (type fixnum start end)
            (type (simple-array fixnum (*)) comps)
            (type function fn))
   (if (= (length comps) 1)
       ;; Non-interleaved scan: raster order over the blocks of one component
-      (let ((bw (component-blocks image (aref comps 0))))
-        (declare (type fixnum bw))
-        (loop for unit fixnum from start below end do
-              (multiple-value-bind (row col) (floor unit bw)
-                (funcall fn 0 (aref comps 0) row col))
-              (setf (scan-x scan) (1+ unit))))
+      (multiple-value-bind (bw bh) (component-blocks image (aref comps 0))
+        (declare (type fixnum bw bh))
+        (let ((v (aref (descriptor-V image) (aref comps 0))))
+          (declare (type fixnum v))
+          (loop for unit fixnum from start below end do
+                (multiple-value-bind (row col) (floor unit bw)
+                  (funcall fn 0 (aref comps 0) row col)
+                  (setf (scan-x scan) (1+ unit))
+                  (when (and band-done (= col (1- bw))
+                             (or (zerop (mod (1+ row) v)) (= row (1- bh))))
+                    (funcall (the function band-done) (floor row v)))))))
       ;; Interleaved scan: H x V blocks of each component per MCU
       (let ((mcus-x (descriptor-mcus-x image)))
         (declare (type fixnum mcus-x))
@@ -2031,8 +2061,10 @@ order. SCAN-X is kept as the number of data units done."
                       for v fixnum = (aref (descriptor-V image) c) do
                       (dotimes (by v)
                         (dotimes (bx h)
-                          (funcall fn sc c (plus (mul mcu-y v) by) (plus (mul mcu-x h) bx))))))
-              (setf (scan-x scan) (1+ unit))))))
+                          (funcall fn sc c (plus (mul mcu-y v) by) (plus (mul mcu-x h) bx)))))
+                (setf (scan-x scan) (1+ unit))
+                (when (and band-done (= mcu-x (1- mcus-x)))
+                  (funcall (the function band-done) mcu-y)))))))
 
 (defun interval-end (image scan total-units)
   "Returns the end of the restart interval starting at the current data unit"
@@ -2099,22 +2131,27 @@ marker that terminated the scan, or 0 if it ended cleanly."
         (block (descriptor-coefs image))
         (ws (descriptor-idct-ws image))
         (planes (descriptor-planes image))
-        (bpr (descriptor-blocks-per-row image)))
+        (bpr (descriptor-blocks-per-row image))
+        (strip (descriptor-strip-p image)))
     (declare #.*optimize*
              (type simple-vector dc-tables ac-tables dequant planes bpr)
              (type (simple-array sint16 (*)) preds))
     (flet ((decode-one (sc c row col)
              (declare (type fixnum sc c row col))
-             (let ((stride (mul 8 (the fixnum (svref bpr c)))))
-               (declare (type fixnum stride))
+             (let ((stride (mul 8 (the fixnum (svref bpr c))))
+                   ;; strip planes hold the current band only
+                   (prow (if strip (mod row (the fixnum (aref (descriptor-V image) c))) row)))
+               (declare (type fixnum stride prow))
                (decode-block block (svref dc-tables sc) (svref ac-tables sc) (svref dequant sc)
                              br image preds sc)
                (idct-block block ws (svref planes c)
-                           (plus (mul (mul row 8) stride) (mul col 8)) stride))))
-      (declare (dynamic-extent #'decode-one))
+                           (plus (mul (mul prow 8) stride) (mul col 8)) stride)))
+           (band-done (band)
+             (output-band image band)))
+      (declare (dynamic-extent #'decode-one #'band-done))
       (catch 'marker
         (map-scan-blocks image scan comps (scan-x scan) (interval-end image scan total-units)
-                         #'decode-one)
+                         #'decode-one (when strip #'band-done))
         (chunk-result scan br total-units)))))
 
 ;;; ============================================================
@@ -2372,6 +2409,7 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
   (read-frame-components image)
   (setf (descriptor-progressive-p image) t)
   (allocate-coef-buffers image)
+  (allocate-planes image nil)
   ;; Process scans until EOI
   (loop with term fixnum = 0 do
         (let ((marker (interpret-markers image term)))
@@ -2381,7 +2419,8 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
                  (return))
                 (t (error 'unsupported-jpeg-frame-marker)))))
   ;; All scans done - finalize: IDCT into the component planes
-  (finalize-progressive image))
+  (finalize-progressive image)
+  (output-rows image 0 (descriptor-height image) 0))
 
 ;;; Scan decoding subroutine
 (defun decode-scan (image)
@@ -2397,6 +2436,10 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
                          (lambda (cd) (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))
                          (subseq (scan-cdesc scan) 0 (length comps))))
          (dequant (map 'simple-vector (lambda (c) (dequant-table image c)) comps)))
+    (unless (descriptor-planes image)
+      ;; A scan of all components is the only scan of a sequential frame, so it
+      ;; can be decoded and output one band at a time
+      (allocate-planes image (= (length comps) (descriptor-ncomp image))))
     (decode-scan-intervals image scan
                            (lambda () (decode-chunk image scan comps total-units
                                                     dc-tables ac-tables dequant)))))
@@ -2500,33 +2543,37 @@ horizontally subsampled by two."
                       (neon:u8.16-aref buffer (plus p 32)) (pick b b2 g g2 r r2))))))))
 
 ;;; Writes the decoded image to the output buffer
-(defun output-planes (image convert)
-  "Interleaves the component planes into the output buffer, replicating the
-samples of subsampled components. With CONVERT, three components are converted
-from YCbCr to BGR on the way."
+(defun output-band (image band)
+  "Writes the output rows of BAND (an MCU row) from the strip planes"
+  (let ((y0 (* band 8 (descriptor-vmax image))))
+    (output-rows image y0 (min (descriptor-height image) (+ y0 (* 8 (descriptor-vmax image)))) band)
+    (setf (descriptor-next-band image) (1+ band))))
+
+(defun output-rows (image y0 y1 band)
+  "Interleaves rows Y0 below Y1 of the component planes into the output buffer,
+replicating the samples of subsampled components. Three components are
+converted from YCbCr to BGR on the way unless conversion is off. BAND is the
+band the planes hold when they are strips, else 0."
   (let* ((buffer (descriptor-buffer image))
          (width (descriptor-width image))
-         (height (descriptor-height image))
          (ncomp (descriptor-ncomp image))
          (vmax (descriptor-vmax image))
          (planes (descriptor-planes image))
-         (strides (map 'simple-vector (lambda (n) (* 8 n)) (descriptor-blocks-per-row image)))
-         (xmaps (coerce (loop for c below ncomp
-                              ;; identity maps where no resampling is needed, for the fused loop
-                              collect (or (component-xmap image c)
-                                          (let ((id (make-array width :element-type 'fixnum)))
-                                            (dotimes (x width id) (setf (aref id x) x)))))
-                        'simple-vector)))
+         (bpr (descriptor-blocks-per-row image))
+         (xmaps (descriptor-xmaps image))
+         (convert (and (descriptor-convert-p image) (= ncomp 3))))
     (declare #.*optimize*
              (type uint8-array buffer)
-             (type fixnum width height ncomp vmax)
-             (type simple-vector planes strides xmaps))
+             (type fixnum width ncomp vmax y0 y1 band)
+             (type simple-vector planes bpr xmaps))
     (flet ((plane-row (c y)
              ;; offset of the plane row that output row Y samples
-             (mul (floor (mul y (the fixnum (aref (descriptor-V image) c))) vmax)
-                  (the fixnum (svref strides c)))))
+             (let ((v (aref (descriptor-V image) c)))
+               (declare (type fixnum v))
+               (mul (minus (floor (mul y v) vmax) (mul band (mul 8 v)))
+                    (mul 8 (the fixnum (svref bpr c)))))))
       (declare (inline plane-row))
-      (if (and convert (= ncomp 3))
+      (if convert
           (let* ((py (svref planes 0)) (pcb (svref planes 1)) (pcr (svref planes 2))
                  (my (svref xmaps 0)) (mcb (svref xmaps 1)) (mcr (svref xmaps 2))
                  (clamp +clamp-table+)
@@ -2544,8 +2591,8 @@ from YCbCr to BGR on the way."
                      (type fixnum-array my mcb mcr)
                      (type fixnum hmax hy hc vector-width)
                      (ignorable hmax hy hc))
-            (loop for y fixnum from 0 below height
-                  for out fixnum from 0 by (mul width 3)
+            (loop for y fixnum from y0 below y1
+                  for out fixnum from (mul y0 (mul width 3)) by (mul width 3)
                   for ry fixnum = (plane-row 0 y)
                   for rcb fixnum = (plane-row 1 y)
                   for rcr fixnum = (plane-row 2 y) do
@@ -2568,8 +2615,8 @@ from YCbCr to BGR on the way."
                   (xmap (svref xmaps c)))
               (declare (type uint8-array plane)
                        (type fixnum-array xmap))
-              (loop for y fixnum from 0 below height
-                    for out fixnum from c by (mul width ncomp)
+              (loop for y fixnum from y0 below y1
+                    for out fixnum from (plus (mul y0 (mul width ncomp)) c) by (mul width ncomp)
                     for row fixnum = (plane-row c y) do
                     (if (and (= ncomp 1) (= (the fixnum (aref (descriptor-H image) c)) (descriptor-hmax image)))
                         (replace buffer plane :start1 out :start2 row :end2 (plus row width))
@@ -2656,7 +2703,12 @@ from YCbCr to BGR on the way."
         until (= term +M_EOI+) do
         (when (/= (interpret-markers image term) +M_SOS+)
           (error 'unsupported-jpeg-frame-marker))
-        (setf term (decode-scan image))))
+        (setf term (decode-scan image)))
+  (if (descriptor-strip-p image)
+      ;; bands a truncated scan did not complete
+      (loop for band from (descriptor-next-band image) below (descriptor-mcus-y image)
+            do (output-band image band))
+      (output-rows image 0 (descriptor-height image) 0)))
 
 (defun decode-stream (stream &key buffer (colorspace-conversion t) descriptor cached-source-p (decode-frame t))
   "Return image array, height, width, number of components and APP14 Adobe transform.
@@ -2694,13 +2746,12 @@ Supports both baseline and progressive DCT-based JPEGs."
      (let ((marker (interpret-markers image 0)))
        (if decode-frame
            (let ((ycck (eql (descriptor-adobe-app14-transform image) :ycck-cmyk)))
+             (setf (descriptor-convert-p image) (and colorspace-conversion (not ycck)))
              (cond ((= +M_SOF0+ marker)
                     (decode-frame image buffer))
                    ((= +M_SOF2+ marker)
                     (decode-progressive-frame image buffer))
                    (t (error 'unsupported-jpeg-format :code marker)))
-             (output-planes image (and colorspace-conversion (not ycck)
-                                       (= (descriptor-ncomp image) 3)))
              (when (and colorspace-conversion ycck)
                (ycck-cmyk-convert image)))
            ;; decode-frame-beginning supports baselnie DCT frames
