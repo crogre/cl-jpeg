@@ -528,6 +528,22 @@
 (define-condition jpeg-decoder-error (jpeg-error)
   ())
 
+(define-condition invalid-jpeg-data (jpeg-decoder-error)
+  ((reason :reader invalid-jpeg-data-reason :initarg :reason))
+  (:report (lambda (condition stream)
+	     (format stream "Invalid JPEG data: ~A" (invalid-jpeg-data-reason condition)))))
+
+(defmacro wrap16 (x)
+  "X wrapped to a signed 16-bit value, as stored in 16-bit coefficient arrays
+(corrupt data can produce larger values)"
+  `(the (signed-byte 16) (- (logand (+ (the fixnum ,x) 32768) #xffff) 32768)))
+
+(defmacro check-data (test reason &rest args)
+  "Signals INVALID-JPEG-DATA unless TEST holds. Header values are checked
+before use, as the decoder is compiled without runtime checks."
+  `(unless ,test
+     (error 'invalid-jpeg-data :reason (format nil ,reason ,@args))))
+
 (define-condition unsupported-jpeg-frame-marker (jpeg-decoder-error)
   ()
   (:report (lambda (condition stream)
@@ -1256,10 +1272,10 @@
                         (make-array 8 :initial-contents
                                     (loop for i fixnum from 0 to 7
                                           collecting (make-array 8 :element-type 'uint8))))) :type (simple-array uint8-2d-array (*)))
-  (huff-ac (make-array 2 :initial-contents
-                       (list (make-huffstruct) (make-huffstruct))) :type (simple-array t (*)))
-  (huff-dc (make-array 2 :initial-contents
-                       (list (make-huffstruct) (make-huffstruct))) :type (simple-array t (*)))
+  (huff-ac (make-array 4 :initial-contents
+                       (loop repeat 4 collect (make-huffstruct))) :type (simple-array t (*)))
+  (huff-dc (make-array 4 :initial-contents
+                       (loop repeat 4 collect (make-huffstruct))) :type (simple-array t (*)))
   (cid (make-array 4) :type (simple-array t (*)))
   (scans (make-array 4 :initial-contents
                      (loop for i fixnum from 0 to 3 collecting (make-scan))) :type (simple-array t (*)))
@@ -1321,8 +1337,12 @@ frame geometry. The planes are allocated by ALLOCATE-PLANES."
           (setf (aref (descriptor-cid image) i) (read-jpeg-byte image)) ; Cj
           (setf hv (read-jpeg-byte image))                              ; HV
           (setf (aref (descriptor-H image) i) (ash hv -4))
-          (setf (aref (descriptor-V image) i) (logand hv 7))
-          (setf (aref (descriptor-qdest image) i) (read-jpeg-byte image)))
+          (setf (aref (descriptor-V image) i) (logand hv 15))
+          (setf (aref (descriptor-qdest image) i) (read-jpeg-byte image))
+          (check-data (and (<= 1 (aref (descriptor-H image) i) 4) (<= 1 (aref (descriptor-V image) i) 4))
+                      "sampling factors ~Dx~D" (aref (descriptor-H image) i) (aref (descriptor-V image) i))
+          (check-data (<= (aref (descriptor-qdest image) i) 3)
+                      "quantization table ~D" (aref (descriptor-qdest image) i)))
     (let* ((hmax (loop for i from 0 below ncomp maximize (aref (descriptor-H image) i)))
            (vmax (loop for i from 0 below ncomp maximize (aref (descriptor-V image) i)))
            (mcus-x (ceiling (descriptor-width image) (* hmax 8)))
@@ -1498,9 +1518,13 @@ chunks, or another stream read byte by byte"
   "Reads in quantization tables"
   (let ((len (minus (read-word image) 2)))
     (loop for i fixnum from (1- len) downto 0 by 65
-          for tq fixnum = (logand (read-jpeg-byte image) 7)
+          for pqtq fixnum = (read-jpeg-byte image)
+          for tq fixnum = (logand pqtq 15)
           with intable of-type uint8-array = (make-array 64 :element-type 'uint8)
-          for table = (aref (descriptor-qtables image) tq) do
+          for table = (progn
+                        (check-data (zerop (ash pqtq -4)) "16-bit quantization tables are not supported")
+                        (check-data (<= tq 3) "quantization table ~D" tq)
+                        (aref (descriptor-qtables image) tq)) do
           (loop for pos from 0 to 63 do
                 (setf (aref intable pos) (read-jpeg-byte image)))
           (izigzag8 intable table))))
@@ -1550,15 +1574,21 @@ chunks, or another stream read byte by byte"
     (loop for tcth fixnum = (read-jpeg-byte image)
           for tc fixnum = (ash tcth -4)
           for th fixnum = (logand tcth 15)
-          for tables = (if (zerop tc)
-                           (aref (descriptor-huff-ac image) th)
-                         (aref (descriptor-huff-dc image) th))
+          for tables = (progn
+                         (check-data (and (<= tc 1) (<= th 3)) "Huffman table class ~D, index ~D" tc th)
+                         (if (zerop tc)
+                             (aref (descriptor-huff-ac image) th)
+                             (aref (descriptor-huff-dc image) th)))
           for bits = (huffstruct-bits tables)
           for sum fixnum = 0 do
           (loop for i fixnum from 0 to 15
                 for entry fixnum = (read-jpeg-byte image) do
                 (incf sum entry)
                 (setf (aref bits i) entry))
+          ;; at most 256 values, and code counts that fit the code space
+          (check-data (<= sum 256) "~D Huffman codes" sum)
+          (check-data (<= (loop for i from 0 to 15 sum (ash (aref bits i) (- 15 i))) (ash 1 16))
+                      "Huffman code lengths exceed the code space")
           (setf (huffstruct-huffval tables)
                 (make-array sum :element-type 'uint8
 			    :initial-contents (loop for i fixnum from 0 below sum
@@ -1798,7 +1828,7 @@ inverse DCT does not use them)."
   (with-local-bits (br s)
     ;; DC coefficient
     (let* ((tt (min 16 (the fixnum (huff dc-table))))
-           (dc (plus (aref preds comp) (extend (bits tt) tt))))
+           (dc (wrap16 (plus (aref preds comp) (extend (bits tt) tt)))))
       (setf (aref preds comp) dc
             (aref block 0) (mul dc (aref qz 0))))
     ;; AC coefficients
@@ -2299,7 +2329,21 @@ makes a block reduced to SIZExSIZE samples."
   "Returns the image component indices of the components of SCAN"
   (let ((comps (make-array (scan-ncomp scan) :element-type 'fixnum)))
     (dotimes (i (scan-ncomp scan) comps)
-      (setf (aref comps i) (position (first (aref (scan-cdesc scan) i)) (descriptor-cid image))))))
+      (let ((c (position (first (aref (scan-cdesc scan) i)) (descriptor-cid image)
+                         :end (descriptor-ncomp image))))
+        (check-data c "scan of unknown component ~D" (first (aref (scan-cdesc scan) i)))
+        (setf (aref comps i) c)))))
+
+(defun scan-table (image scan i class)
+  "Returns the Huffman table of class :DC or :AC that SCAN uses for its Ith
+component, which must have been defined"
+  ;; huff-ac stores DC tables (tc=0), huff-dc stores AC tables (tc=1)
+  (let* ((selectors (second (aref (scan-cdesc scan) i)))
+         (table (if (eq class :dc)
+                    (aref (descriptor-huff-ac image) (ash selectors -4))
+                    (aref (descriptor-huff-dc image) (logand selectors 15)))))
+    (check-data (huffstruct-maxcode table) "scan uses an undefined Huffman table")
+    table))
 
 (defun scan-units (image comps)
   "Returns the number of data units (MCUs, or blocks of a non-interleaved scan) in a scan"
@@ -2369,9 +2413,13 @@ bit reader met"
     (read-jpeg-byte image) ; length
     (read-jpeg-byte image)
     (loop with ncomp fixnum = (setf (scan-ncomp scan) (read-jpeg-byte image))
+          initially (check-data (<= 1 ncomp 4) "~D components in a scan" ncomp)
           for j fixnum from 0 below ncomp do
           (setf (first (aref (scan-cdesc scan) j)) (read-jpeg-byte image)) ; component ID
-          (setf (second (aref (scan-cdesc scan) j)) (read-jpeg-byte image))) ; Td and Ta nibbles
+          (setf (second (aref (scan-cdesc scan) j)) (read-jpeg-byte image)) ; Td and Ta nibbles
+          (check-data (and (<= (ash (second (aref (scan-cdesc scan) j)) -4) 3)
+                           (<= (logand (second (aref (scan-cdesc scan) j)) 15) 3))
+                      "Huffman table selectors ~X" (second (aref (scan-cdesc scan) j))))
     (setf (scan-ss scan) (read-jpeg-byte image))          ; spectral selection start
     (setf (scan-se scan) (read-jpeg-byte image))          ; spectral selection end
     (let ((ahal (read-jpeg-byte image)))                   ; successive approximation
@@ -2462,9 +2510,9 @@ marker that terminated the scan, or 0 if it ended cleanly."
     (let* ((tt (min 16 (the fixnum (huff dc-table))))
            (diff (extend (bits tt) tt)))
       (declare (type fixnum tt diff))
-      (incf diff (aref preds comp))
+      (setf diff (wrap16 (plus diff (aref preds comp))))
       (setf (aref preds comp) diff)
-      (setf (aref coef-buf offset) (ash diff al)))))
+      (setf (aref coef-buf offset) (wrap16 (ash diff al))))))
 
 ;;; Decodes DC refinement scan (Ss=0, Se=0, Ah>0) - one raw bit per block
 (defun decode-dc-refine (coef-buf offset al br image)
@@ -2501,7 +2549,7 @@ marker that terminated the scan, or 0 if it ended cleanly."
               ((> s 0)
                (incf k r)
                (setf (aref coef-buf (+ offset (logand k 63)))
-                     (ash (extend (bits s) s) al))
+                     (wrap16 (ash (extend (bits s) s) al)))
                (incf k))
               ;; ZRL: skip 16 zeros
               ((= r 15)
@@ -2533,7 +2581,7 @@ marker that terminated the scan, or 0 if it ended cleanly."
                       (when (and (/= coeff 0)
                                  (= (bits 1) 1)
                                  (zerop (logand coeff p1)))
-                        (incf (aref coef-buf pos) (if (> coeff 0) p1 m1))))))
+                        (setf (aref coef-buf pos) (wrap16 (plus coeff (if (> coeff 0) p1 m1))))))))
         (block decode
           ;; If in an EOB run, just apply correction bits to existing nonzeros
           (when (> eobrun 0)
@@ -2681,17 +2729,26 @@ file is in memory, otherwise collected in one buffer."
             (let* ((scan (read-scan-header image))
                    (comps (scan-components image scan))
                    (dc-scan-p (zerop (scan-ss scan)))
+                   (checked (progn
+                              (check-data (if dc-scan-p
+                                              (zerop (scan-se scan))
+                                              (and (<= (scan-ss scan) (scan-se scan) 63) (= (length comps) 1)))
+                                          "progressive scan of coefficients ~D to ~D for ~D components"
+                                          (scan-ss scan) (scan-se scan) (length comps))
+                              (check-data (and (<= (scan-ah scan) 13) (<= (scan-al scan) 13))
+                                          "successive approximation ~D, ~D" (scan-ah scan) (scan-al scan))))
                    ;; a scaled image only needs the lowest frequencies: scans
                    ;; of higher ones are skipped
                    (needed (<= (scan-ss scan) (scaled-coefficient-limit image comps)))
-                   ;; copies, as DHT segments may redefine the tables for later scans
-                   (tables (map 'simple-vector
-                                (lambda (cd)
-                                  (copy-huffstruct
-                                   (if dc-scan-p
-                                       (aref (descriptor-huff-ac image) (ash (the fixnum (second cd)) -4))
-                                       (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))))
-                                (subseq (scan-cdesc scan) 0 (length comps)))))
+                   ;; copies, as DHT segments may redefine the tables for later
+                   ;; scans; DC refinement scans read raw bits and use none
+                   (tables (coerce (loop for i below (length comps)
+                                         collect (if (and dc-scan-p (plusp (scan-ah scan)))
+                                                     nil
+                                                     (copy-huffstruct
+                                                      (scan-table image scan i (if dc-scan-p :dc :ac)))))
+                                   'simple-vector)))
+              (declare (ignore checked))
               (when needed
                 (push (make-scan-cursor scan comps (scan-units image comps) tables
                                         (descriptor-restart-interval image)
@@ -2876,12 +2933,10 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
   (let* ((scan (read-scan-header image))
          (comps (scan-components image scan))
          (total-units (scan-units image comps))
-         (dc-tables (map 'simple-vector
-                         (lambda (cd) (aref (descriptor-huff-ac image) (ash (the fixnum (second cd)) -4)))
-                         (subseq (scan-cdesc scan) 0 (length comps))))
-         (ac-tables (map 'simple-vector
-                         (lambda (cd) (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))
-                         (subseq (scan-cdesc scan) 0 (length comps))))
+         (dc-tables (coerce (loop for i below (length comps) collect (scan-table image scan i :dc))
+                            'simple-vector))
+         (ac-tables (coerce (loop for i below (length comps) collect (scan-table image scan i :ac))
+                            'simple-vector))
          (dequant (map 'simple-vector (lambda (c) (dequant-table image c)) comps))
          (limits (map 'simple-vector (lambda (c) (scaled-coefficient-limit image (vector c))) comps)))
     (unless (descriptor-planes image)
@@ -3017,7 +3072,7 @@ passes them to the row callback if there is one."
     (when callback
       (setf (descriptor-buffer-row0 image) y0))
     (output-rows image y0 y1 band)
-    (when (descriptor-ycck-p image)
+    (when (and (descriptor-ycck-p image) (= (descriptor-ncomp image) 4))
       (ycck-cmyk-convert image (- y0 (descriptor-buffer-row0 image)) (- y1 (descriptor-buffer-row0 image))))
     (when callback
       (loop with row-bytes = (* (descriptor-out-width image) (descriptor-ncomp image))
@@ -3163,10 +3218,14 @@ band the planes hold when they are strips, else 0."
   "Reads the frame header up to the component specifications"
   (read-jpeg-byte image) ; length
   (read-jpeg-byte image)
-  (read-jpeg-byte image) ; sample precision
+  (let ((precision (read-jpeg-byte image)))
+    (check-data (= precision 8) "~D-bit samples are not supported" precision))
   (setf (descriptor-height image) (read-word image)
         (descriptor-width image) (read-word image)
         (descriptor-ncomp image) (read-jpeg-byte image))
+  (check-data (and (plusp (descriptor-height image)) (plusp (descriptor-width image)))
+              "image size ~Dx~D" (descriptor-width image) (descriptor-height image))
+  (check-data (<= 1 (descriptor-ncomp image) 4) "~D components" (descriptor-ncomp image))
   ;; scaled output size, rounded up
   (setf (descriptor-out-height image) (ceiling (* (descriptor-height image) (descriptor-block-size image)) 8)
         (descriptor-out-width image) (ceiling (* (descriptor-width image) (descriptor-block-size image)) 8)))
@@ -3231,7 +3290,7 @@ image, rounded up."
      (let ((marker (interpret-markers image 0)))
        (if decode-frame
            (let ((ycck (eql (descriptor-adobe-app14-transform image) :ycck-cmyk)))
-             (setf (descriptor-convert-p image) (and colorspace-conversion (not ycck))
+             (setf (descriptor-convert-p image) colorspace-conversion
                    (descriptor-ycck-p image) (and colorspace-conversion ycck)
                    (descriptor-row-callback image) row-callback)
              (cond ((= +M_SOF0+ marker)

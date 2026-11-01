@@ -14,6 +14,7 @@
            #:decode-stream
            #:decode-image
 	   #:jpeg-error #:jpeg-encoder-error #:jpeg-decoder-error #:unsupported-jpeg-format #:unrecognized-file-format
+	   #:invalid-jpeg-data
 	   #:convert-cmyk-to-rgb
 	   #:allocate-buffer
 	   #:jpeg-file-dimensions
