@@ -70,7 +70,7 @@
 (declaim (inline csize quantize get-average zigzag read-jpeg-byte
                  llm-dct descale crunch colorspace-convert subsample inverse-llm-dct
                  dequantize extend peek-bits skip-bits get-bits huff-decode
-                 decode-ac decode-dc decode-block idct-block
+                 decode-block idct-block
                  write-bits limit))
 
 (deftype uint8 () '(unsigned-byte 8))
@@ -1281,8 +1281,14 @@
        '(0  0  0  0  0  0  0  0)
        '(0  0  0  0  0  0  0  0))
       :type sint16-2d-array)	; Temporary workspace for IDCT
+  ;; Input: bytes SOURCE-POS below SOURCE-END of SOURCE are next. BYTE-READER
+  ;; refills SOURCE and returns the new end, or 0 when there is no more data.
   (byte-reader #'(lambda () ;in case setup fails somehow
 		   (error 'jpeg-decoder-error)) :type function)
+  (source (make-array 0 :element-type 'uint8) :type uint8-array)
+  (source-pos 0 :type fixnum)
+  (source-end 0 :type fixnum)
+  (stream-buffer nil)       ; chunk buffer for reading file streams
   (source-cache)
   (adobe-app14-transform nil)
   (progressive-p nil)       ; t when decoding SOF2 (progressive) frame
@@ -1372,7 +1378,57 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
 
 (defun read-jpeg-byte (image)
   (declare #.*optimize*)
-  (the uint8 (funcall (descriptor-byte-reader image))))
+  (let ((pos (descriptor-source-pos image)))
+    (declare (type fixnum pos))
+    (when (>= pos (descriptor-source-end image))
+      (setf pos (refill-source image)))
+    (setf (descriptor-source-pos image) (1+ pos))
+    (aref (descriptor-source image) pos)))
+
+(defun refill-source (image)
+  "Refills the input buffer and returns the position of its first byte"
+  (let ((end (funcall (descriptor-byte-reader image))))
+    (declare (type fixnum end))
+    (when (zerop end)
+      (error 'end-of-file :stream nil))
+    (setf (descriptor-source-end image) end
+          (descriptor-source-pos image) 0)))
+
+(defun set-source (image stream cached-source-p)
+  "Sets up the input of IMAGE: the source cache, a file stream read in
+chunks, or another stream read byte by byte"
+  (cond (cached-source-p
+         (when (or (not (typep (descriptor-source-cache image) 'uint8-array))
+                   (and (typep stream 'file-stream)
+                        (< (length (descriptor-source-cache image)) (file-length stream))))
+           (setf (descriptor-source-cache image) (make-array (file-length stream) :element-type 'uint8)))
+         (when stream ;; NULL stream means the cache in descriptor is already read
+           (read-sequence (descriptor-source-cache image) stream))
+         (setf (descriptor-source image) (descriptor-source-cache image)
+               (descriptor-source-end image) (length (descriptor-source-cache image))
+               (descriptor-byte-reader image) (lambda () 0)))
+        ;; Seekable streams are read in chunks; RELEASE-SOURCE moves the
+        ;; position back to just after the data used
+        ((and (typep stream 'file-stream) (file-position stream))
+         (unless (descriptor-stream-buffer image)
+           (setf (descriptor-stream-buffer image) (make-array 32768 :element-type 'uint8)))
+         (let ((buffer (descriptor-stream-buffer image)))
+           (setf (descriptor-source image) buffer
+                 (descriptor-source-end image) 0
+                 (descriptor-byte-reader image) (lambda () (read-sequence buffer stream)))))
+        (t
+         (let ((buffer (make-array 1 :element-type 'uint8)))
+           (setf (descriptor-source image) buffer
+                 (descriptor-source-end image) 0
+                 (descriptor-byte-reader image)
+                 (lambda () (setf (aref buffer 0) (read-byte stream)) 1)))))
+  (setf (descriptor-source-pos image) 0))
+
+(defun release-source (image stream)
+  "Leaves a chunk-read STREAM positioned just after the data decoded"
+  (when (and stream (eq (descriptor-source image) (descriptor-stream-buffer image)))
+    (file-position stream (- (file-position stream)
+                             (- (descriptor-source-end image) (descriptor-source-pos image))))))
 
 ;;; Reads an JPEG marker from the stream
 (defun read-marker (s)
@@ -1618,6 +1674,25 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
   (prog1 (peek-bits br s n)
     (skip-bits br n)))
 
+;;; The DECODE procedure, for codes longer than the 9-bit lookup table
+(defun huff-decode-slow (table code16)
+  "Decodes the Huffman code at the start of the 16 bits CODE16. Returns the
+value and the code length (17 for an invalid code)."
+  (declare #.*optimize*
+           (type huffstruct table)
+           (type (unsigned-byte 16) code16))
+  (let ((maxcode (huffstruct-maxcode table))
+        (mincode (huffstruct-mincode table))
+        (valptr (huffstruct-valptr table))
+        (huffval (huffstruct-huffval table)))
+    (declare (type (simple-array fixnum (*)) maxcode mincode valptr)
+             (type uint8-array huffval))
+    (loop for l fixnum from 10 to 16
+          for code fixnum = (ash code16 (minus l 16))
+          when (<= code (aref maxcode l))
+            do (return (values (aref huffval (plus (aref valptr l) (minus code (aref mincode l)))) l))
+          finally (return (values 0 17)))))
+
 ;;; The DECODE procedure, with a table lookup for codes of up to 9 bits
 (defun huff-decode (table br s)
   "Decodes one Huffman-coded value"
@@ -1629,19 +1704,49 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
     (if (/= entry 0)
         (progn (skip-bits br (ash entry -8))
                (logand entry 255))
-        (let ((maxcode (huffstruct-maxcode table))
-              (mincode (huffstruct-mincode table))
-              (valptr (huffstruct-valptr table))
-              (huffval (huffstruct-huffval table)))
-          (declare (type (simple-array fixnum (*)) maxcode mincode valptr)
-                   (type uint8-array huffval))
-          (loop for l fixnum from 10 to 16
-                for code fixnum = (ash code16 (minus l 16))
-                when (<= code (aref maxcode l)) do
-                (skip-bits br l)
-                (return (aref huffval (plus (aref valptr l) (minus code (aref mincode l)))))
-                finally (skip-bits br 17) ; invalid code
-                        (return 0))))))
+        (multiple-value-bind (value length) (huff-decode-slow table code16)
+          (skip-bits br length)
+          value))))
+
+;;; The same operations on a bit buffer held in local variables
+(defmacro with-local-bits ((br s) &body body)
+  "Evaluates BODY with the bit buffer of BR in local variables, written back
+when BODY returns. Within BODY, (PEEK N), (SKIP N), (BITS N) and (HUFF TABLE)
+work like PEEK-BITS, SKIP-BITS, GET-BITS and HUFF-DECODE."
+  (let ((buf (gensym "BUF")) (cnt (gensym "CNT")))
+    `(let ((,buf (bitreader-buf ,br))
+           (,cnt (bitreader-cnt ,br)))
+       (declare (type (unsigned-byte 64) ,buf)
+                (type (integer 0 64) ,cnt))
+       (macrolet ((peek (n)
+                    `(progn
+                       (when (< ,',cnt ,n)
+                         (setf (bitreader-buf ,',br) ,',buf (bitreader-cnt ,',br) ,',cnt)
+                         (fill-bits ,',br ,',s)
+                         (setf ,',buf (bitreader-buf ,',br) ,',cnt (bitreader-cnt ,',br)))
+                       (logand (ash ,',buf (- (the (integer 0 64) (- ,',cnt ,n)))) (1- (ash 1 ,n)))))
+                  (skip (n)
+                    `(let ((left (- ,',cnt ,n)))
+                       (when (< left (bitreader-pad ,',br))
+                         (throw 'marker (bitreader-marker ,',br)))
+                       (setf ,',cnt left)))
+                  (bits (n)
+                    `(let ((nbits ,n))
+                       (prog1 (peek nbits) (skip nbits))))
+                  (huff (table)
+                    `(let* ((tab ,table)
+                            (code16 (peek 16))
+                            (entry (aref (huffstruct-lookup tab) (ash code16 -7))))
+                       (declare (type (unsigned-byte 16) code16 entry))
+                       (if (/= entry 0)
+                           (progn (skip (ash entry -8))
+                                  (logand entry 255))
+                           (multiple-value-bind (value length) (huff-decode-slow tab code16)
+                             (skip length)
+                             value)))))
+         (multiple-value-prog1 (progn ,@body)
+           (setf (bitreader-buf ,br) ,buf
+                 (bitreader-cnt ,br) ,cnt))))))
 
 ;;; Natural (row-major) position of each zigzag-ordered coefficient
 (declaim (type fixnum-array +zigzag-natural+))
@@ -1659,48 +1764,6 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
       (let ((n (aref +zigzag-natural+ k)))
         (setf (aref qz k) (u8ref q (mod n 8) (floor n 8)))))))
 
-;;; Decodes AC coefficients
-(defun decode-ac (block table qz br s)
-  "Decodes AC coefficients into BLOCK, dequantized and in natural order"
-  (declare #.*optimize*
-           (type sint32-array block)
-           (type fixnum-array qz))
-  (loop with fast-ac of-type (simple-array sint16 (512)) = (huffstruct-fast-ac table)
-        with natural of-type fixnum-array = +zigzag-natural+
-        with k fixnum = 1
-        until (> k 63)
-        do (let ((fast (aref fast-ac (peek-bits br s 9))))
-             (declare (type fixnum fast))
-             (if (/= fast 0)
-                 ;; Short code and value: decoded with a single lookup
-                 (progn (skip-bits br (logand fast 15))
-                        (incf k (logand (ash fast -4) 15))
-                        (let ((z (logand k 63)))
-                          (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))))
-                        (incf k))
-                 (let* ((rs (huff-decode table br s))
-                        (ssss (logand rs 15))
-                        (r (ash rs -4)))
-                   (declare (type fixnum rs ssss r))
-                   (cond ((zerop ssss)
-                          (if (= r 15)
-                              (incf k 16)
-                              (return)))
-                         (t (incf k r)
-                            (let ((z (logand k 63)))
-                              (setf (aref block (aref natural z))
-                                    (mul (extend (get-bits br s ssss) ssss) (aref qz z))))
-                            (incf k)))))))
-  block)
-
-;;; Decodes DC value
-(defun decode-dc (table br s)
-  "Decodes DC value"
-  (let ((tt (min 16 (the fixnum (huff-decode table br s)))))
-    (declare #.*optimize*
-             (fixnum tt))
-    (extend (get-bits br s tt) tt)))
-
 ;;; Decodes single 8x8 block
 (defun decode-block (block dc-table ac-table qz br s preds comp)
   "Reads one 8x8 block into BLOCK, dequantized and in natural order"
@@ -1710,10 +1773,40 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
            (type (simple-array sint16 (*)) preds)
            (type fixnum comp))
   (fill block 0)
-  (let ((dc (plus (aref preds comp) (decode-dc dc-table br s))))
-    (setf (aref preds comp) dc
-          (aref block 0) (mul dc (aref qz 0))))
-  (decode-ac block ac-table qz br s))
+  (with-local-bits (br s)
+    ;; DC coefficient
+    (let* ((tt (min 16 (the fixnum (huff dc-table))))
+           (dc (plus (aref preds comp) (extend (bits tt) tt))))
+      (setf (aref preds comp) dc
+            (aref block 0) (mul dc (aref qz 0))))
+    ;; AC coefficients
+    (loop with fast-ac of-type (simple-array sint16 (512)) = (huffstruct-fast-ac ac-table)
+          with natural of-type fixnum-array = +zigzag-natural+
+          with k fixnum = 1
+          until (> k 63)
+          do (let ((fast (aref fast-ac (peek 9))))
+               (declare (type fixnum fast))
+               (if (/= fast 0)
+                   ;; Short code and value: decoded with a single lookup
+                   (progn (skip (logand fast 15))
+                          (incf k (logand (ash fast -4) 15))
+                          (let ((z (logand k 63)))
+                            (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))))
+                          (incf k))
+                   (let* ((rs (huff ac-table))
+                          (ssss (logand rs 15))
+                          (r (ash rs -4)))
+                     (declare (type fixnum rs ssss r))
+                     (cond ((zerop ssss)
+                            (if (= r 15)
+                                (incf k 16)
+                                (return)))
+                           (t (incf k r)
+                              (let ((z (logand k 63)))
+                                (setf (aref block (aref natural z))
+                                      (mul (extend (bits ssss) ssss) (aref qz z))))
+                              (incf k))))))))
+  block)
 
 ;;; Dequanitzation
 (defun dequantize (x y block table)
@@ -2167,12 +2260,13 @@ marker that terminated the scan, or 0 if it ended cleanly."
            (type (simple-array sint16 (*)) preds)
            (type huffstruct dc-table)
            (type bitreader br))
-  (let* ((tt (huff-decode dc-table br image))
-         (diff (extend (get-bits br image tt) tt)))
-    (declare (type fixnum tt diff))
-    (incf diff (aref preds comp))
-    (setf (aref preds comp) diff)
-    (setf (aref coef-buf offset) (ash diff al))))
+  (with-local-bits (br image)
+    (let* ((tt (min 16 (the fixnum (huff dc-table))))
+           (diff (extend (bits tt) tt)))
+      (declare (type fixnum tt diff))
+      (incf diff (aref preds comp))
+      (setf (aref preds comp) diff)
+      (setf (aref coef-buf offset) (ash diff al)))))
 
 ;;; Decodes DC refinement scan (Ss=0, Se=0, Ah>0) - one raw bit per block
 (defun decode-dc-refine (coef-buf offset al br image)
@@ -2181,9 +2275,8 @@ marker that terminated the scan, or 0 if it ended cleanly."
            (type fixnum offset al)
            (type (simple-array sint16 (*)) coef-buf)
            (type bitreader br))
-  (let ((bit (get-bits br image 1)))
-    (declare (type fixnum bit))
-    (when (= bit 1)
+  (with-local-bits (br image)
+    (when (= (bits 1) 1)
       (setf (aref coef-buf offset)
             (logior (aref coef-buf offset) (ash 1 al))))))
 
@@ -2198,10 +2291,10 @@ marker that terminated the scan, or 0 if it ended cleanly."
            (type bitreader br))
   (when (> eobrun 0)
     (return-from decode-ac-first (1- eobrun)))
-  (let ((k ss))
-    (declare (type fixnum k))
-    (loop while (<= k se) do
-          (let* ((rs (huff-decode ac-table br image))
+  (with-local-bits (br image)
+    (loop with k fixnum = ss
+          while (<= k se) do
+          (let* ((rs (huff ac-table))
                  (s (logand rs 15))
                  (r (ash rs -4)))
             (declare (type fixnum rs s r))
@@ -2209,21 +2302,16 @@ marker that terminated the scan, or 0 if it ended cleanly."
               ;; Non-zero coefficient
               ((> s 0)
                (incf k r)
-               (setf (aref coef-buf (+ offset k))
-                     (ash (extend (get-bits br image s) s) al))
+               (setf (aref coef-buf (+ offset (logand k 63)))
+                     (ash (extend (bits s) s) al))
                (incf k))
               ;; ZRL: skip 16 zeros
               ((= r 15)
                (incf k 16))
-              ;; EOBn: end of band run
+              ;; EOBn: end of band run; the current block is the first in the run
               (t
-               (let ((run (ash 1 r)))
-                 (declare (type fixnum run))
-                 (when (> r 0)
-                   (incf run (get-bits br image r)))
-                 ;; Current block is the first in the run
-                 (return-from decode-ac-first (1- run))))))))
-  0)
+               (return (1- (+ (ash 1 r) (if (> r 0) (bits r) 0)))))))
+          finally (return 0))))
 
 ;;; Decodes AC refinement scan (Ss>0, Ah>0)
 (defun decode-ac-refine (coef-buf offset ss se al ac-table br image eobrun)
@@ -2234,82 +2322,72 @@ marker that terminated the scan, or 0 if it ended cleanly."
            (type (simple-array sint16 (*)) coef-buf)
            (type huffstruct ac-table)
            (type bitreader br))
-  (let ((p1 (ash 1 al))
-        (m1 (- (ash 1 al)))
-        (k ss))
-    (declare (type fixnum p1 m1 k))
-    (flet ((apply-correction (pos)
-             "Read one correction bit for a nonzero coefficient at coef-buf[pos]."
-             (declare (type fixnum pos))
-             (let ((coeff (aref coef-buf pos)))
-               (declare (type fixnum coeff))
-               (when (/= coeff 0)
-                 (when (= (get-bits br image 1) 1)
-                   (if (> coeff 0)
-                       (when (zerop (logand coeff p1))
-                         (incf (aref coef-buf pos) p1))
-                       (when (zerop (logand coeff p1))
-                         (incf (aref coef-buf pos) m1))))
-                 t))))
-      ;; If in an EOB run, just apply correction bits to existing nonzeros
-      (when (> eobrun 0)
-        (loop for j fixnum from ss to se do
-              (apply-correction (+ offset j)))
-        (return-from decode-ac-refine (1- eobrun)))
-      ;; Decode new symbols
-      (loop while (<= k se) do
-            (let* ((rs (huff-decode ac-table br image))
-                   (s (logand rs 15))
-                   (r (ash rs -4)))
-              (declare (type fixnum rs s r))
-              (cond
-                ;; s=1: new nonzero coefficient
-                ((= s 1)
-                 (let ((sign-bit (get-bits br image 1)))
-                   (declare (type fixnum sign-bit))
-                   (let ((new-value (if (= sign-bit 1) p1 m1)))
-                     (declare (type fixnum new-value))
-                     ;; Skip r zero-valued positions (applying corrections to nonzeros)
-                     (loop while (and (<= k se) (> r 0)) do
-                           (let ((coeff (aref coef-buf (+ offset k))))
-                             (declare (type fixnum coeff))
-                             (if (/= coeff 0)
+  (with-local-bits (br image)
+    (let ((p1 (ash 1 al))
+          (m1 (- (ash 1 al)))
+          (k ss))
+      (declare (type fixnum p1 m1 k))
+      (macrolet ((apply-correction (pos)
+                   ;; Reads one correction bit for a nonzero coefficient at coef-buf[pos]
+                   `(let* ((pos ,pos)
+                           (coeff (aref coef-buf pos)))
+                      (declare (type fixnum pos coeff))
+                      (when (and (/= coeff 0)
+                                 (= (bits 1) 1)
+                                 (zerop (logand coeff p1)))
+                        (incf (aref coef-buf pos) (if (> coeff 0) p1 m1))))))
+        (block decode
+          ;; If in an EOB run, just apply correction bits to existing nonzeros
+          (when (> eobrun 0)
+            (loop for j fixnum from ss to se do
+                  (apply-correction (+ offset j)))
+            (return-from decode (1- eobrun)))
+          ;; Decode new symbols
+          (loop while (<= k se) do
+                (let* ((rs (huff ac-table))
+                       (s (logand rs 15))
+                       (r (ash rs -4)))
+                  (declare (type fixnum rs s r))
+                  (cond
+                    ;; s=1: new nonzero coefficient
+                    ((= s 1)
+                     (let ((new-value (if (= (bits 1) 1) p1 m1)))
+                       (declare (type fixnum new-value))
+                       ;; Skip r zero-valued positions (applying corrections to nonzeros)
+                       (loop while (and (<= k se) (> r 0)) do
+                             (if (/= (aref coef-buf (+ offset k)) 0)
                                  (apply-correction (+ offset k))
-                                 (decf r)))
-                           (incf k))
-                     ;; Skip past remaining nonzeros to find the zero position
-                     (loop while (and (<= k se)
-                                      (/= (aref coef-buf (+ offset k)) 0))
-                           do (apply-correction (+ offset k))
-                              (incf k))
-                     ;; Place the new coefficient
-                     (when (<= k se)
-                       (setf (aref coef-buf (+ offset k)) new-value)
-                       (incf k)))))
-                ;; s=0, r=15: ZRL with correction bits
-                ((= r 15)
-                 (let ((zeros-to-skip 16))
-                   (declare (type fixnum zeros-to-skip))
-                   (loop while (and (<= k se) (> zeros-to-skip 0)) do
-                         (let ((coeff (aref coef-buf (+ offset k))))
-                           (declare (type fixnum coeff))
-                           (if (/= coeff 0)
-                               (apply-correction (+ offset k))
-                               (decf zeros-to-skip)))
+                                 (decf r))
+                             (incf k))
+                       ;; Skip past remaining nonzeros to find the zero position
+                       (loop while (and (<= k se)
+                                        (/= (aref coef-buf (+ offset k)) 0))
+                             do (apply-correction (+ offset k))
+                                (incf k))
+                       ;; Place the new coefficient
+                       (when (<= k se)
+                         (setf (aref coef-buf (+ offset k)) new-value)
                          (incf k))))
-                ;; s=0, r<15: EOBn
-                (t
-                 (let ((run (ash 1 r)))
-                   (declare (type fixnum run))
-                   (when (> r 0)
-                     (incf run (get-bits br image r)))
-                   ;; Apply correction bits to remaining nonzeros in this block
-                   (loop while (<= k se) do
-                         (apply-correction (+ offset k))
-                         (incf k))
-                   (return-from decode-ac-refine (1- run)))))))
-      ;; Normal completion (no EOB)
-      0)))
+                    ;; s=0, r=15: ZRL with correction bits
+                    ((= r 15)
+                     (let ((zeros-to-skip 16))
+                       (declare (type fixnum zeros-to-skip))
+                       (loop while (and (<= k se) (> zeros-to-skip 0)) do
+                             (if (/= (aref coef-buf (+ offset k)) 0)
+                                 (apply-correction (+ offset k))
+                                 (decf zeros-to-skip))
+                             (incf k))))
+                    ;; s=0, r<15: EOBn
+                    (t
+                     (let ((run (+ (ash 1 r) (if (> r 0) (bits r) 0))))
+                       (declare (type fixnum run))
+                       ;; Apply correction bits to remaining nonzeros in this block
+                       (loop while (<= k se) do
+                             (apply-correction (+ offset k))
+                             (incf k))
+                       (return-from decode (1- run)))))))
+          ;; Normal completion (no EOB)
+          0)))))
 
 ;;; Progressive frames are decoded one band (MCU row) at a time: all scans
 ;;; are read first, then each band is decoded from every scan in turn,
@@ -2821,28 +2899,8 @@ Supports both baseline and progressive DCT-based JPEGs."
     (loop for scan across (descriptor-scans descriptor) do ;required if we reuse descriptors
 	 (setf (scan-x scan) 0
 	       (scan-y scan) 0)))
-  (let* ((image (or descriptor (make-descriptor)))
-	 (pos 0))
-    (cond (cached-source-p
-           (when (or (not (typep (descriptor-source-cache image) 'array))
-                     (and (typep stream 'file-stream) (< (length (descriptor-source-cache image)) (file-length stream))))
-             (setf (descriptor-source-cache image) (make-array (file-length stream) :element-type 'uint8)))
-           (when stream ;; NULL stream means the cache in descriptor is already read
-             (read-sequence (descriptor-source-cache image) stream))
-           (let ((cache (descriptor-source-cache image)))
-             (setf (descriptor-byte-reader image)
-                   #'(lambda ()
-                       (declare #.*optimize*
-                                (type uint8-array cache)
-                                (type fixnum pos))
-                       (prog1 (aref cache pos) (incf pos))))))
-          ;; if descriptor is NULL or the descriptor's byte-reader is
-          ;; NULL, set it here.
-          ((or (not descriptor)
-               (not (descriptor-byte-reader descriptor)))
-           (setf (descriptor-byte-reader image)
-                 #'(lambda ()
-                     (read-byte stream)))))
+  (let ((image (or descriptor (make-descriptor))))
+    (set-source image stream cached-source-p)
      (unless (= (read-marker image) +M_SOI+)
       (error 'unrecognized-file-format))
      (let ((marker (interpret-markers image 0)))
@@ -2862,6 +2920,7 @@ Supports both baseline and progressive DCT-based JPEGs."
                       (= +M_SOF2+ marker))
                   (decode-frame-beginning image nil))
                  (t (error 'unsupported-jpeg-format :code marker)))))
+     (release-source image stream)
      (values (when decode-frame
                (descriptor-buffer image))
              (descriptor-height image)
