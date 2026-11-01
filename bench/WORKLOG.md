@@ -24,7 +24,7 @@ Branches, for comparing implementations afterwards:
 | 2. input + Huffman | `exp/2-input-huffman` | `648f502` |
 | 3. sparse IDCT | `exp/3-sparse-idct` | `648f502` |
 | 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-band output) |
-| 5. optional features | `exp/5-*` | decided later |
+| 5. combined + row callback + scaling | `exp/5-combined` | `exp/4-progressive-bands` + merges of 2 and 3 |
 
 Experiment branches hold only code; this worklog and the results live
 on `low-memory-experiments`.
@@ -209,4 +209,77 @@ Tooling note: sb-sprof attributes most samples to `ycc-to-bgr-neon` on
 these branches (93% for a baseline image where color conversion is a
 few ms), presumably for lack of debug info at (debug 0); timing phases
 directly is reliable, the flat profile currently is not.
+
+### 2026-11-01 — Experiment 5: combined, row callback, scaling — done (`exp/5-combined`)
+
+Scope decided with the project owner: combine 1-4, add a row callback and
+scaled decoding; threads not wanted.
+
+**Combination** (merge commits up to d3ffbfc). Experiments 2 and 3 merged
+into `exp/4-progressive-bands`. Experiment 4's scan cursors now read from
+experiment 2's input buffer: with the whole file in memory they point
+into the source cache (no copy, `skip-entropy-data` scans past each
+scan); otherwise the data is collected into one buffer. All checks pass,
+plus: stream and in-memory decodes byte-identical (354 images), three
+concatenated JPEGs from one stream.
+
+**Row callback** (4762691). `:row-callback fn` on `decode-stream` /
+`decode-image`: called with (buffer start y) per row, top to bottom;
+rows are produced per band in a band-sized buffer (YCCK conversion per
+band too) and NIL is returned instead of an image. Also: the output
+buffer is now only allocated when a frame is decoded, so
+`jpeg-file-dimensions` no longer allocates a whole image.
+`callback-check.lisp`: rows identical to normal decoding (354 images,
+full size and 1/4).
+
+**Scaling** (cccbe92). `:scale` 1, 1/2, 1/4, 1/8. Reduced inverse DCTs of
+the lowest NxN coefficients (direct DCT scaling, Vollbeding / libjpeg 7+),
+generated unrolled by `define-reduced-idct` from one table function; 1x1
+is the DC value. Per-component block sizes as in libjpeg-turbo:
+subsampled components are scaled less when both sampling ratios allow
+(4:2:0 chroma), otherwise replicated (4:2:2). Progressive scans whose
+spectral range starts beyond the coefficients needed are skipped (only
+DC scans at 1/8). Output size rounded up as in libjpeg.
+
+Verification: reduced IDCTs match a floating-point evaluation of the same
+transform within 1 (100000 random blocks each). Against `djpeg -scale`:
+max diff 12-18, mean <= 6 (avg ~2) at 1/2 and 1/4 — libjpeg-turbo uses its
+older averaging IDCTs (`jidctred`) for these scales, a different filter;
+at 1/8 every non-4:2:0 pixel differs by exactly 1 (see finding below).
+
+| 2048x2048 | stb | combined | + row callback |
+|---|---|---|---|
+| base420 | 25.2 ms / 18.9 MB | 20.6 ms / 12.7 MB | 0.26 MB |
+| base444 | 66.3 ms / 25.2 MB | 59.6 ms / 12.8 MB | 0.24 MB |
+| gray | 15.1 ms / 8.4 MB | 13.2 ms / 4.3 MB | |
+| prog420 | 49.6 ms / 31.5 MB | 44.4 ms / 12.9 MB | 0.40 MB |
+| smooth420 | 16.5 ms / 18.9 MB | 9.2 ms / 12.7 MB | |
+| prog420 4000x3000 | 142.0 ms / 90.2 MB | 126.8 ms / 36.5 MB | 0.70 MB |
+
+Scaled (time / allocation, from memory):
+
+| image | 1 | 1/2 | 1/4 | 1/8 |
+|---|---|---|---|---|
+| base420 2048 | 19.4 ms / 12.7 MB | 18.1 / 3.3 | 15.0 / 0.9 | 12.5 / 0.3 |
+| base444 2048 | 58.8 / 12.8 | 63.1 / 3.3 | 49.2 / 0.9 | 48.1 / 0.3 |
+| prog420 2048 | 43.6 / 12.9 | 43.4 / 3.4 | 28.6 / 1.0 | 13.4 / 0.4 |
+| smooth420 2048 | 9.7 / 12.8 | 9.4 / 3.3 | 6.4 / 0.9 | 3.8 / 0.3 |
+| prog420 4000x3000 | 122.5 / 36.5 | 122.5 / 9.4 | 84.6 / 2.6 | 37.9 / 0.9 |
+
+Sequential images stay bound by entropy decoding (every coefficient must
+be decoded), so scaling mostly saves memory there; progressive images
+also gain speed from skipped scans.
+
+Findings / follow-ups:
+- **Level shift bias (pre-existing):** cl-jpeg level shifts IDCT output
+  by 127 instead of 128 (and centers chroma on 127), so its output is 1
+  lower than libjpeg's everywhere. Hidden by the djpeg check's tolerance
+  of 6; visible as an exact 1.00 mean difference at 1/8. Worth fixing in
+  a separate change (scalar/NEON/DC/reduced paths and color conversion).
+- Band-by-band progressive still costs ~3 ms vs experiment 2 alone
+  (prog420 2048: 44.4 vs 41.9 ms); not investigated.
+- 1/2 is slightly slower than full size for noisy 4:4:4 (63 vs 59 ms):
+  the scalar 4x4 IDCT vs the NEON 8x8. A NEON 4x4 would fix it.
+- At 1/2-1/8, sequential decoding could skip storing coefficients the
+  reduced IDCT does not read (it must still decode them).
 
