@@ -20,9 +20,9 @@ Branches, for comparing implementations afterwards:
 
 | experiment | branch | based on |
 |---|---|---|
-| 1. MCU rows | `exp/1-mcu-rows` | `eab3e29` |
-| 2. input + Huffman | `exp/2-input-huffman` | `eab3e29` |
-| 3. sparse IDCT | `exp/3-sparse-idct` | `eab3e29` |
+| 1. MCU rows | `exp/1-mcu-rows` | `3b9e4c6` |
+| 2. input + Huffman | `exp/2-input-huffman` | `3b9e4c6` |
+| 3. sparse IDCT | `exp/3-sparse-idct` | `3b9e4c6` |
 | 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-row output) |
 | 5. optional features | `exp/5-*` | decided later |
 
