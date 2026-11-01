@@ -23,7 +23,7 @@ Branches, for comparing implementations afterwards:
 | 1. MCU rows | `exp/1-mcu-rows` | `648f502` |
 | 2. input + Huffman | `exp/2-input-huffman` | `648f502` |
 | 3. sparse IDCT | `exp/3-sparse-idct` | `648f502` |
-| 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-row output) |
+| 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-band output) |
 | 5. optional features | `exp/5-*` | decided later |
 
 Experiment branches hold only code; this worklog and the results live
@@ -174,4 +174,39 @@ random blocks, exact). All checks pass.
 Note on method: all tests run in fresh SBCL processes (write, compile,
 test), since the hot code is inline functions and macros that a REPL
 would leave stale in their callers.
+
+### 2026-11-01 — Experiment 4: progressive bands — done (`exp/4-progressive-bands`, 643f601)
+
+Based on `exp/1-mcu-rows` (uses its strip planes and `output-band`).
+`read-progressive-scans` reads all scans up to EOI, keeping per scan a
+cursor with its header, copies of the Huffman tables in effect (DHT can
+change between scans), its restart interval and its entropy-coded data
+(copied into one buffer, terminating marker kept so the bit reader
+stops). Each band is then decoded from every scan in turn
+(`advance-cursor`: resumes position, bit reader, EOB run, DC predictors;
+handles RSTn at interval ends and resyncs on early ones), then
+dequantized/IDCT'd into the strip planes and output. Coefficient
+buffers are one band high. All 354 images pass on the first run,
+including progressive files with every restart setting.
+
+| image | stb MB | before MB | exp4 MB |
+|---|---|---|---|
+| prog420 2048 | 31.5 | 31.6 | **14.9** |
+| prog420 4000x3000 | 90.2 | 90.4 | **40.6** |
+
+(Allocation measured; part of the excess over the 12.6/36 MB output is
+garbage from growing the scan data buffer by doubling, so the true peak
+is a bit lower.)
+
+Speed: prog420 2048 58.7 -> 63.1 ms (+7%), 4000x3000 168 -> 179 ms. The
+expected locality gain did not appear. The cost is input handling on
+this branch: copying the scan data (~2.2 ms for 705 KB, measured) and
+reading it back through a per-cursor closure. With experiment 2's
+buffered source the copy can be skipped for in-memory sources and the
+cursors can read their buffer directly; re-measure when combining.
+
+Tooling note: sb-sprof attributes most samples to `ycc-to-bgr-neon` on
+these branches (93% for a baseline image where color conversion is a
+few ms), presumably for lack of debug info at (debug 0); timing phases
+directly is reliable, the flat profile currently is not.
 
