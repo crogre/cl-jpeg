@@ -52,3 +52,14 @@ if [ ! -f check/list.txt ]; then
     rm -f s$sz.ppm g$sz.pgm
   done
 fi
+
+# djpeg references for scaled decoding (scale-check.lisp)
+if [ ! -f check/scaled/.done ]; then
+  mkdir -p check/scaled
+  for d in 2 4 8; do
+    for f in $(cat check/list.txt); do
+      djpeg -dct int -nosmooth -scale 1/$d check/$f.jpg > check/scaled/${f}_$d.ref
+    done
+  done
+  touch check/scaled/.done
+fi

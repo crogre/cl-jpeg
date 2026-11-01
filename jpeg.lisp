@@ -1303,6 +1303,10 @@
   (ycck-p nil)              ; t when YCCK is to be converted to CMYK on output
   (row-callback nil)        ; called for each output row instead of filling a whole image
   (buffer-row0 0 :type fixnum) ; image row stored at the start of BUFFER
+  (block-size 8 :type fixnum) ; output samples per block side: 8, 4, 2 or 1 when scaling
+  (comp-sizes nil)            ; per-component samples per block side (larger for subsampled ones)
+  (out-width 0 :type fixnum)  ; output dimensions, scaled
+  (out-height 0 :type fixnum)
   (hmax 1 :type fixnum)     ; maximum sampling factors
   (vmax 1 :type fixnum)
   (mcus-x 0 :type fixnum)   ; MCUs per row and column
@@ -1327,6 +1331,18 @@ frame geometry. The planes are allocated by ALLOCATE-PLANES."
            (bpc (make-array ncomp)))
       (setf (descriptor-hmax image) hmax
             (descriptor-vmax image) vmax
+            ;; When scaling, subsampled components are scaled less where the
+            ;; sampling factors allow, rather than upsampled (as libjpeg does)
+            (descriptor-comp-sizes image)
+            (let ((size (descriptor-block-size image)))
+              (coerce (loop for c below ncomp
+                            collect (loop with ssize = size
+                                          while (and (< ssize 8)
+                                                     (zerop (mod (* hmax size) (* (aref (descriptor-H image) c) ssize 2)))
+                                                     (zerop (mod (* vmax size) (* (aref (descriptor-V image) c) ssize 2))))
+                                          do (setf ssize (* ssize 2))
+                                          finally (return ssize)))
+                      'simple-vector))
             (descriptor-mcus-x image) mcus-x
             (descriptor-mcus-y image) mcus-y)
       (dotimes (c ncomp)
@@ -1343,7 +1359,8 @@ otherwise covering the whole image. Also prepares the output column maps."
         (planes (make-array (descriptor-ncomp image))))
     (dotimes (c ncomp)
       (setf (aref planes c)
-            (make-array (+ 16 (* 64 (aref (descriptor-blocks-per-row image) c) ; 16: room for 16-byte loads
+            (make-array (+ 16 (* (expt (svref (descriptor-comp-sizes image) c) 2) ; 16: room for 16-byte loads
+                                 (aref (descriptor-blocks-per-row image) c)
                                  (if strip
                                      (aref (descriptor-V image) c)
                                      (aref (descriptor-blocks-per-col image) c))))
@@ -1355,7 +1372,7 @@ otherwise covering the whole image. Also prepares the output column maps."
           (coerce (loop for c below ncomp
                         ;; identity maps where no resampling is needed, for the fused loop
                         collect (or (component-xmap image c)
-                                    (let ((id (make-array (descriptor-width image) :element-type 'fixnum)))
+                                    (let ((id (make-array (descriptor-out-width image) :element-type 'fixnum)))
                                       (dotimes (x (length id) id) (setf (aref id x) x)))))
                   'simple-vector))))
 
@@ -2125,31 +2142,85 @@ quarter, a row pass and a transposition back. SPARSE means only the top left
                                         (setf (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,row ,stride)) -3)) a
                                               (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,(1+ row) ,stride)) -3)) b))))))))))))))))
 
-(defun idct-block (block ws plane pos stride last)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun scaled-idct-table (n)
+    "Fixed point coefficients of the N-point inverse DCT that evaluates the
+lowest N frequencies of an 8-point DCT at N evenly spaced positions, giving
+the block reduced by 8/N (direct DCT scaling, as in libjpeg)"
+    (let ((table (make-array (* n n) :element-type 'fixnum)))
+      (dotimes (x n table)
+        (dotimes (u n)
+          (setf (aref table (+ (* x n) u))
+                (round (* (ash 1 dct-shift) 1/2 (if (zerop u) (sqrt 1/2) 1)
+                          (cos (/ (* (1+ (* 2 x)) u pi) (* 2 n)))))))))))
+
+(defmacro define-reduced-idct (name n)
+  "Defines NAME as the inverse transform of the top left NxN coefficients of a
+block into an NxN block of samples, unrolled with constant coefficients"
+  (let ((table (scaled-idct-table n)))
+    (flet ((dot (coefs terms)
+             `(the fixnum (+ ,@(mapcar (lambda (k term) `(mul ,k ,term)) coefs terms)))))
+      `(defun ,name (block ws plane pos stride)
+         ,(format nil "Inverse transforms the top left ~Dx~:*~D coefficients of BLOCK into ~:*~Dx~:*~D samples
+in PLANE at POS, rows STRIDE apart" n)
+         (declare #.*optimize*
+                  (type sint32-array block)
+                  (type fixnum-array ws)
+                  (type uint8-array plane)
+                  (type fixnum pos stride))
+         ;; columns, keeping 2 extra bits
+         ,@(loop for v below n
+                 append (loop for x below n
+                              collect `(setf (aref ws ,(+ (* x 8) v))
+                                             (descale ,(dot (loop for u below n collect (aref table (+ (* x n) u)))
+                                                            (loop for u below n collect `(aref block ,(+ (* u 8) v))))
+                                                      ,(- dct-shift 2)))))
+         ;; rows
+         ,@(loop for x below n
+                 append (loop for y below n
+                              collect `(let ((s (plus 127 (descale ,(dot (loop for v below n collect (aref table (+ (* y n) v)))
+                                                                         (loop for v below n collect `(aref ws ,(+ (* x 8) v))))
+                                                                   ,(+ dct-shift 2)))))
+                                         (declare (type fixnum s))
+                                         (setf (aref plane (plus pos ,(if (zerop x) y `(plus (mul ,x stride) ,y))))
+                                               (if (logtest s -256) (if (minusp s) 0 255) s)))))
+         nil))))
+
+(define-reduced-idct idct-4x4 4)
+(define-reduced-idct idct-2x2 2)
+
+(defun idct-block (block ws plane pos stride last &optional (size 8))
   "Performs inverse LLM DCT on BLOCK (dequantized, natural order) and stores the
 samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart. LAST is
 the zigzag index of the last nonzero coefficient: blocks with DC only are
 filled with a constant, and the NEON version has a cheaper variant for
-coefficients in the top left 4x4 corner (zigzag indices up to 9)."
+coefficients in the top left 4x4 corner (zigzag indices up to 9). SIZE below 8
+makes a block reduced to SIZExSIZE samples."
   (declare #.*optimize*
            (type sint32-array block)
            (type fixnum-array ws)
            (type uint8-array plane)
-           (type fixnum pos stride last)
+           (type fixnum pos stride last size)
            #+cl-jpeg-neon (ignorable ws))
-  (cond ((zerop last)
+  (cond ((or (zerop last) (= size 1))
          ;; same result as the full transform of a DC-only block
          (let ((s (plus 127 (descale (ash (aref block 0) 1) 4))))
            (declare (type fixnum s))
            (let ((sample (if (logtest s -256) (if (minusp s) 0 255) s)))
              (declare (type uint8 sample))
-             #+sbcl
-             (let ((word (* sample #x0101010101010101)))
-               (dotimes (row 8)
-                 (setf (sb-kernel:%vector-raw-bits plane (ash (plus pos (mul row stride)) -3)) word)))
-             #-sbcl
-             (dotimes (row 8)
-               (fill plane sample :start (plus pos (mul row stride)) :end (plus pos (plus (mul row stride) 8)))))))
+             (if (= size 8)
+                 #+sbcl
+                 (let ((word (* sample #x0101010101010101)))
+                   (dotimes (row 8)
+                     (setf (sb-kernel:%vector-raw-bits plane (ash (plus pos (mul row stride)) -3)) word)))
+                 #-sbcl
+                 (dotimes (row 8)
+                   (fill plane sample :start (plus pos (mul row stride)) :end (plus pos (plus (mul row stride) 8))))
+                 (dotimes (row size)
+                   (dotimes (col size)
+                     (setf (aref plane (plus pos (plus (mul row stride) col))) sample)))))))
+        ((= size 4) (idct-4x4 block ws plane pos stride))
+        ((= size 2) (idct-2x2 block ws plane pos stride))
         #+cl-jpeg-neon
         ((<= last 9) (neon-idct-block block plane pos stride t))
         (t
@@ -2276,22 +2347,24 @@ marker that terminated the scan, or 0 if it ended cleanly."
         (planes (descriptor-planes image))
         (bpr (descriptor-blocks-per-row image))
         (strip (descriptor-strip-p image))
+        (sizes (descriptor-comp-sizes image))
         (natural +zigzag-natural+))
     (declare #.*optimize*
-             (type simple-vector dc-tables ac-tables dequant planes bpr)
+             (type simple-vector dc-tables ac-tables dequant planes bpr sizes)
              (type fixnum-array natural)
              (type (simple-array sint16 (*)) preds))
     (flet ((decode-one (sc c row col)
              (declare (type fixnum sc c row col))
-             (let ((stride (mul 8 (the fixnum (svref bpr c))))
-                   ;; strip planes hold the current band only
+             (let* ((size (svref sizes c))
+                    (stride (mul size (the fixnum (svref bpr c))))
+                    ;; strip planes hold the current band only
                    (prow (if strip (mod row (the fixnum (aref (descriptor-V image) c))) row)))
-               (declare (type fixnum stride prow))
+               (declare (type fixnum size stride prow))
                (let ((last (decode-block block (svref dc-tables sc) (svref ac-tables sc)
                                          (svref dequant sc) br image preds sc)))
                  (declare (type fixnum last))
                  (idct-block block ws (svref planes c)
-                             (plus (mul (mul prow 8) stride) (mul col 8)) stride last)
+                             (plus (mul (mul prow size) stride) (mul col size)) stride last size)
                  ;; leave the block all zero for the next one
                  (if (< last 16)
                      (loop for k fixnum from 0 to last
@@ -2470,27 +2543,40 @@ marker that terminated the scan, or 0 if it ended cleanly."
   (done nil))                       ; t once the scan's data has run out
 
 (defun skip-entropy-data (image)
-  "Moves past entropy-coded data (and RSTn markers) in a source holding the
-whole file, returning the marker that ends it"
+  "Moves past entropy-coded data (and RSTn markers) in the input, returning the
+marker that ends it"
   (let ((data (descriptor-source image))
         (pos (descriptor-source-pos image))
         (end (descriptor-source-end image)))
     (declare #.*optimize*
              (type uint8-array data)
              (type fixnum pos end))
-    (loop
-      (when (>= pos end)
-        (error 'end-of-file :stream nil))
-      (when (= (aref data pos) #xff)
-        (loop do (incf pos) ; skipping fill bytes
-              while (and (< pos end) (= (aref data pos) #xff)))
-        (when (>= pos end)
-          (error 'end-of-file :stream nil))
-        (let ((b2 (aref data pos)))
-          (unless (or (zerop b2) (<= +M_RST0+ b2 +M_RST7+))
-            (setf (descriptor-source-pos image) (1+ pos))
-            (return b2))))
-      (incf pos))))
+    (macrolet ((next-byte ()
+                 ;; the byte at POS, refilling the buffer when it is used up
+                 `(progn
+                    (when (>= pos end)
+                      (setf (descriptor-source-pos image) pos
+                            pos (refill-source image)
+                            end (descriptor-source-end image)
+                            data (descriptor-source image)))
+                    (aref data pos))))
+      (loop
+        (when (= (next-byte) #xff)
+          (loop do (incf pos) ; skipping fill bytes
+                while (= (next-byte) #xff))
+          (let ((b2 (next-byte)))
+            (unless (or (zerop b2) (<= +M_RST0+ b2 +M_RST7+))
+              (setf (descriptor-source-pos image) (1+ pos))
+              (return b2))))
+        (incf pos)))))
+
+(defun scaled-coefficient-limit (image comps)
+  "Returns the highest zigzag index of the coefficients that the block sizes of
+components COMPS need"
+  (loop for c across comps
+        for n = (svref (descriptor-comp-sizes image) c)
+        maximize (loop for row below n
+                       maximize (loop for col below n maximize (u8ref +zigzag-index+ col row)))))
 
 (defun read-progressive-scans (image)
   "Reads the scans of a progressive frame up to EOI. Returns a cursor for each
@@ -2518,6 +2604,9 @@ file is in memory, otherwise collected in one buffer."
             (let* ((scan (read-scan-header image))
                    (comps (scan-components image scan))
                    (dc-scan-p (zerop (scan-ss scan)))
+                   ;; a scaled image only needs the lowest frequencies: scans
+                   ;; of higher ones are skipped
+                   (needed (<= (scan-ss scan) (scaled-coefficient-limit image comps)))
                    ;; copies, as DHT segments may redefine the tables for later scans
                    (tables (map 'simple-vector
                                 (lambda (cd)
@@ -2526,12 +2615,13 @@ file is in memory, otherwise collected in one buffer."
                                        (aref (descriptor-huff-ac image) (ash (the fixnum (second cd)) -4))
                                        (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))))
                                 (subseq (scan-cdesc scan) 0 (length comps)))))
-              (push (make-scan-cursor scan comps (scan-units image comps) tables
-                                      (descriptor-restart-interval image)
-                                      (if cached (descriptor-source-pos image) fill))
-                    cursors)
+              (when needed
+                (push (make-scan-cursor scan comps (scan-units image comps) tables
+                                        (descriptor-restart-interval image)
+                                        (if cached (descriptor-source-pos image) fill))
+                      cursors))
               (setf term
-                    (if cached
+                    (if (or cached (not needed))
                         (skip-entropy-data image)
                         ;; The entropy-coded data, including RSTn markers, up to
                         ;; the next marker, which is kept so that the bit reader
@@ -2658,10 +2748,11 @@ planes, and clears them for the next band."
              (qz (svref dequant c))
              (bpr (aref (descriptor-blocks-per-row image) c))
              (plane (aref (descriptor-planes image) c))
-             (stride (mul 8 bpr)))
+             (size (svref (descriptor-comp-sizes image) c))
+             (stride (mul size bpr)))
         (declare (type (simple-array sint16 (*)) coef-buf)
                  (type fixnum-array qz)
-                 (type fixnum bpr stride))
+                 (type fixnum bpr size stride))
         (dotimes (row (aref (descriptor-V image) c))
           (dotimes (col bpr)
             (let ((offset (mul 64 (plus (mul row bpr) col)))
@@ -2671,7 +2762,7 @@ planes, and clears them for the next band."
                 (let ((coef (aref coef-buf (plus offset k))))
                   (unless (zerop coef) (setf last k))
                   (setf (aref block (aref natural k)) (mul coef (aref qz k)))))
-              (idct-block block ws plane (plus (mul (mul row 8) stride) (mul col 8)) stride last))))
+              (idct-block block ws plane (plus (mul (mul row size) stride) (mul col size)) stride last size))))
         (fill coef-buf 0)))))
 
 ;;; Progressive frame decoding subroutine
@@ -2739,12 +2830,13 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
 (defun component-xmap (image c)
   "Maps each output column to the column of component C's plane it samples,
 or returns NIL if they are the same"
-  (let ((xmap (make-array (descriptor-width image) :element-type 'fixnum))
-        (h (aref (descriptor-H image) c))
-        (hmax (descriptor-hmax image)))
-    (unless (= h hmax)
+  (let ((xmap (make-array (descriptor-out-width image) :element-type 'fixnum))
+        ;; plane columns per output column, as a ratio
+        (num (* (aref (descriptor-H image) c) (svref (descriptor-comp-sizes image) c)))
+        (den (* (descriptor-hmax image) (descriptor-block-size image))))
+    (unless (= num den)
       (dotimes (x (length xmap) xmap)
-        (setf (aref xmap x) (floor (* x h) hmax))))))
+        (setf (aref xmap x) (floor (* x num) den))))))
 
 ;;; YCbCr to RGB conversion coefficients, 16-bit fixed point. Samples are
 ;;; level shifted by 127, as in the IDCT, so the chroma is centered on 127.
@@ -2824,16 +2916,17 @@ horizontally subsampled by two."
 ;;; Writes the decoded image to the output buffer
 (defun output-band (image band)
   "Writes the output rows of BAND (an MCU row) from the strip planes"
-  (let ((y0 (* band 8 (descriptor-vmax image))))
-    (emit-rows image y0 (min (descriptor-height image) (+ y0 (* 8 (descriptor-vmax image)))) band)
+  (let ((y0 (* band (descriptor-block-size image) (descriptor-vmax image))))
+    (emit-rows image y0 (min (descriptor-out-height image) (+ y0 (* (descriptor-block-size image) (descriptor-vmax image))))
+               band)
     (setf (descriptor-next-band image) (1+ band))))
 
 (defun output-image (image)
   "Writes the whole image from whole-image planes, a band of rows at a time
 when rows are passed to a callback"
-  (let ((height (descriptor-height image)))
+  (let ((height (descriptor-out-height image)))
     (if (descriptor-row-callback image)
-        (loop with step = (* 8 (descriptor-vmax image))
+        (loop with step = (* (descriptor-block-size image) (descriptor-vmax image))
               for y0 from 0 below height by step
               do (emit-rows image y0 (min height (+ y0 step)) 0))
         (emit-rows image 0 height 0))))
@@ -2849,7 +2942,7 @@ passes them to the row callback if there is one."
     (when (descriptor-ycck-p image)
       (ycck-cmyk-convert image (- y0 (descriptor-buffer-row0 image)) (- y1 (descriptor-buffer-row0 image))))
     (when callback
-      (loop with row-bytes = (* (descriptor-width image) (descriptor-ncomp image))
+      (loop with row-bytes = (* (descriptor-out-width image) (descriptor-ncomp image))
             for y from y0 below y1
             do (funcall callback (descriptor-buffer image) (* (- y y0) row-bytes) y)))))
 
@@ -2859,35 +2952,40 @@ replicating the samples of subsampled components. Three components are
 converted from YCbCr to BGR on the way unless conversion is off. BAND is the
 band the planes hold when they are strips, else 0."
   (let* ((buffer (descriptor-buffer image))
-         (width (descriptor-width image))
+         (width (descriptor-out-width image))
          (ncomp (descriptor-ncomp image))
          (vmax (descriptor-vmax image))
+         (size (descriptor-block-size image))
+         (sizes (descriptor-comp-sizes image))
          (planes (descriptor-planes image))
          (bpr (descriptor-blocks-per-row image))
          (xmaps (descriptor-xmaps image))
          (convert (and (descriptor-convert-p image) (= ncomp 3))))
     (declare #.*optimize*
              (type uint8-array buffer)
-             (type fixnum width ncomp vmax y0 y1 band)
-             (type simple-vector planes bpr xmaps))
+             (type fixnum width ncomp vmax size y0 y1 band)
+             (type simple-vector planes bpr xmaps sizes))
     (flet ((plane-row (c y)
              ;; offset of the plane row that output row Y samples
-             (let ((v (aref (descriptor-V image) c)))
-               (declare (type fixnum v))
-               (mul (minus (floor (mul y v) vmax) (mul band (mul 8 v)))
-                    (mul 8 (the fixnum (svref bpr c)))))))
+             (let ((v (aref (descriptor-V image) c))
+                   (csize (svref sizes c)))
+               (declare (type fixnum v csize))
+               (mul (minus (floor (mul y (mul v csize)) (mul vmax size)) (mul band (mul csize v)))
+                    (mul csize (the fixnum (svref bpr c)))))))
       (declare (inline plane-row))
       (if convert
           (let* ((py (svref planes 0)) (pcb (svref planes 1)) (pcr (svref planes 2))
                  (my (svref xmaps 0)) (mcb (svref xmaps 1)) (mcr (svref xmaps 2))
                  (clamp +clamp-table+)
-                 (hmax (descriptor-hmax image))
-                 (hy (aref (descriptor-H image) 0))
-                 (hc (aref (descriptor-H image) 1))
+                 ;; horizontal resolutions in output space
+                 (hmax (* (descriptor-hmax image) size))
+                 (hy (* (aref (descriptor-H image) 0) (the fixnum (svref sizes 0))))
+                 (hc (* (aref (descriptor-H image) 1) (the fixnum (svref sizes 1))))
                  ;; pixels per row converted 16 at a time with SIMD: needs full
                  ;; resolution luma and full or half resolution chroma
                  (vector-width (if (and #+cl-jpeg-neon t #-cl-jpeg-neon nil
-                                        (= hy hmax) (= hc (aref (descriptor-H image) 2))
+                                        (= hy hmax)
+                                        (= hc (* (aref (descriptor-H image) 2) (the fixnum (svref sizes 2))))
                                         (or (= hc hmax) (= (* 2 hc) hmax)))
                                    (logandc2 width 15)
                                    0)))
@@ -2929,16 +3027,16 @@ band the planes hold when they are strips, else 0."
                               for p fixnum from out by ncomp do
                               (setf (aref buffer p) (aref plane (plus row (aref xmap x)))))))))))))
 
-(defun ycck-cmyk-convert (image &optional (start 0) (end (descriptor-height image)))
+(defun ycck-cmyk-convert (image &optional (start 0) (end (descriptor-out-height image)))
   "Converts rows START below END of the output buffer from YCCK to CMYK"
   (let* ((buffer (descriptor-buffer image))
-         (nw (mul (descriptor-width image) 4)))
+         (nw (mul (descriptor-out-width image) 4)))
     (declare #.*optimize*
 	     (type (simple-array uint8 (*)) buffer)
              (type fixnum nw start end))
     (loop for y fixnum from start below end
        for yp fixnum from (mul start nw) by nw do
-	 (loop for x fixnum from 0 below (descriptor-width image)
+	 (loop for x fixnum from 0 below (descriptor-out-width image)
 	    for py fixnum from yp by 4
 	    for pu fixnum = (1+ py)
 	    for pv fixnum = (plus py 2)
@@ -2990,24 +3088,28 @@ band the planes hold when they are strips, else 0."
   (read-jpeg-byte image) ; sample precision
   (setf (descriptor-height image) (read-word image)
         (descriptor-width image) (read-word image)
-        (descriptor-ncomp image) (read-jpeg-byte image)))
+        (descriptor-ncomp image) (read-jpeg-byte image))
+  ;; scaled output size, rounded up
+  (setf (descriptor-out-height image) (ceiling (* (descriptor-height image) (descriptor-block-size image)) 8)
+        (descriptor-out-width image) (ceiling (* (descriptor-width image) (descriptor-block-size image)) 8)))
 
 (defun allocate-output (image buffer)
   "Sets up the output buffer: BUFFER if given, else a new one for the whole
 image, or for one band of rows when rows are passed to a callback"
-  (let ((size (* (descriptor-height image) (descriptor-width image) (descriptor-ncomp image))))
+  (let* ((height (descriptor-out-height image))
+         (width (descriptor-out-width image))
+         (size (* height width (descriptor-ncomp image))))
     (setf (descriptor-buffer-row0 image) 0
           (descriptor-buffer image)
           (cond ((descriptor-row-callback image)
-                 (allocate-buffer (min (descriptor-height image) (* 8 (descriptor-vmax image)))
-                                  (descriptor-width image) (descriptor-ncomp image)))
+                 (allocate-buffer (min height (* (descriptor-block-size image) (descriptor-vmax image)))
+                                  width (descriptor-ncomp image)))
                 ((arrayp buffer)
                  (when (< (length buffer) size)
                    (error 'invalid-buffer-supplied :buffer buffer))
                  buffer)
                 (t
-                 (allocate-buffer (descriptor-height image) (descriptor-width image)
-                                  (descriptor-ncomp image)))))))
+                 (allocate-buffer height width (descriptor-ncomp image)))))))
 
 ;;; Frame decoding subroutine
 (defun decode-frame (image buffer)
@@ -3026,21 +3128,25 @@ image, or for one band of rows when rows are passed to a callback"
       (output-image image)))
 
 (defun decode-stream (stream &key buffer (colorspace-conversion t) descriptor cached-source-p (decode-frame t)
-                               row-callback)
+                               row-callback (scale 1))
   "Return image array, height, width, number of components and APP14 Adobe transform.
 Supports both baseline and progressive DCT-based JPEGs. With ROW-CALLBACK, no
 image array is made: the function is called with a buffer, a start index and
 the row number for each row of the image, top to bottom, the row's samples
 being the next width x ncomp bytes from the start index. The buffer is reused,
 so the samples are only valid during the call, and NIL is returned in place of
-the image array."
+the image array. SCALE (1, 1/2, 1/4 or 1/8) decodes a reduced image, using
+reduced inverse DCTs; the returned height and width are those of the scaled
+image, rounded up."
   (when (and (null stream) (not cached-source-p))
     (error 'invalid-buffer-supplied))
   (when descriptor
     (loop for scan across (descriptor-scans descriptor) do ;required if we reuse descriptors
 	 (setf (scan-x scan) 0
 	       (scan-y scan) 0)))
+  (check-type scale (member 1 1/2 1/4 1/8))
   (let ((image (or descriptor (make-descriptor))))
+    (setf (descriptor-block-size image) (* 8 scale))
     (set-source image stream cached-source-p)
      (unless (= (read-marker image) +M_SOI+)
       (error 'unrecognized-file-format))
@@ -3064,21 +3170,22 @@ the image array."
      (release-source image stream)
      (values (when (and decode-frame (not row-callback))
                (descriptor-buffer image))
-             (descriptor-height image)
-             (descriptor-width image)
+             (descriptor-out-height image)
+             (descriptor-out-width image)
              (descriptor-ncomp image)
              (descriptor-adobe-app14-transform image))))
 
 ;;; Top level decoder function
 (defun decode-image (filename &key buffer (colorspace-conversion t) cached-source-p (decode-frame t)
-                                 row-callback)
+                                 row-callback (scale 1))
   (with-open-file (in filename :direction :input :element-type 'uint8)
     (decode-stream in
                    :buffer buffer
                    :colorspace-conversion colorspace-conversion
                    :cached-source-p cached-source-p
                    :decode-frame decode-frame
-                   :row-callback row-callback)))
+                   :row-callback row-callback
+                   :scale scale)))
 
 (defun decode-stream-height-width-ncomp (stream &key descriptor cached-source-p)
   "Return the height and width of the JPEG data read from STREAM. Does less work than
