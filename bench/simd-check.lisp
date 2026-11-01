@@ -10,7 +10,7 @@
         (incf n)
         (let ((bgr (jpeg:decode-image f)))
           (dotimes (i (* h w))
-            (let* ((p (* 3 i)) (y (aref raw p)) (cb (- (aref raw (+ p 1)) 127)) (cr (- (aref raw (+ p 2)) 127)))
+            (let* ((p (* 3 i)) (y (aref raw p)) (cb (- (aref raw (+ p 1)) 128)) (cr (- (aref raw (+ p 2)) 128)))
               (unless (and (= (aref bgr p) (clamp (+ y (term cb 116130))))
                            (= (aref bgr (+ p 1)) (clamp (+ y (term cb -22554 cr -46802))))
                            (= (aref bgr (+ p 2)) (clamp (+ y (term cr 91881)))))

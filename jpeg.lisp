@@ -429,25 +429,25 @@
                                         :element-type 'fixnum
                                         :initial-contents
                                         (loop for i from 0 to 255
-                                              for x from -127
+                                              for x from -128
                                               collect (ash (plus (mul +1.40200+ x) +one-half+) (- shift)))))
 (define-constant +cb-g-tab+ (make-array 256
                                         :element-type 'fixnum
                                         :initial-contents
                                         (loop for i from 0 to 255
-                                              for x from -127
+                                              for x from -128
                                               collect (plus (mul +-0.34414+ x) +one-half+))))
 (define-constant +cr-g-tab+ (make-array 256
                                         :element-type 'fixnum
                                         :initial-contents
                                         (loop for i from 0 to 255
-                                              for x from -127
+                                              for x from -128
                                               collect (mul +-0.71414+ x))))
 (define-constant +cb-b-tab+ (make-array 256
                                         :element-type 'fixnum
                                         :initial-contents
                                         (loop for i from 0 to 255
-                                              for x from -127
+                                              for x from -128
                                               collect (ash (plus (mul +1.77200+ x) +one-half+) (- shift)))))
 
 ;;; Constants for LLM DCT
@@ -476,9 +476,9 @@
 ;;; Post-IDCT limiting array
 (defvar *idct-limit-array* (make-array 512 :initial-element 0 :element-type 'uint8))
 (loop for n from 0
-      for i from 128 to 383 do
+      for i from 127 to 382 do
       (setf (aref *idct-limit-array* i) n))
-(loop for i from 384 to 511 do
+(loop for i from 383 to 511 do
       (setf (aref *idct-limit-array* i) 255))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2030,7 +2030,7 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
   (macrolet ((mulc (x c) `(mul ,x ,c))
              (shl (x) `(ash ,x dct-shift))
              (sample (v) ; level shift and clamp
-               `(let ((s (plus ,v 127)))
+               `(let ((s (plus ,v 128)))
                   (declare (type fixnum s))
                   (if (logtest s -256) (if (minusp s) 0 255) s))))
     (dotimes (col 8) ; iterating over columns
@@ -2109,9 +2109,9 @@ quarter, a row pass and a transposition back. SPARSE means only the top left
                     (mulc (a c) `(neon:s32.4* ,a (neon:s32.4-broadcast ,c)))
                     (shl (a) `(neon:s32.4-shiftl ,a dct-shift))
                     (descale (v n) `(neon:s32.4-shiftr (neon:s32.4+ ,v (neon:s32.4-broadcast ,(ash 1 (1- n)))) ,n))
-                    ;; descale, level shift by 127 and round in one go; clamped when narrowing
+                    ;; descale, level shift by 128 and round in one go; clamped when narrowing
                     (sample (v) `(neon:s32.4-shiftr
-                                  (neon:s32.4+ ,v (neon:s32.4-broadcast ,(+ (ash 1 (1- +shift+4+)) (ash 127 +shift+4+))))
+                                  (neon:s32.4+ ,v (neon:s32.4-broadcast ,(+ (ash 1 (1- +shift+4+)) (ash 128 +shift+4+))))
                                   +shift+4+)))
            (flet ((transpose4 (r0 r1 r2 r3)
                     (let ((t0 (neon:s64.2! (neon:s32.4-transpose-even r0 r1)))
@@ -2178,7 +2178,7 @@ in PLANE at POS, rows STRIDE apart" n)
          ;; rows
          ,@(loop for x below n
                  append (loop for y below n
-                              collect `(let ((s (plus 127 (descale ,(dot (loop for v below n collect (aref table (+ (* y n) v)))
+                              collect `(let ((s (plus 128 (descale ,(dot (loop for v below n collect (aref table (+ (* y n) v)))
                                                                          (loop for v below n collect `(aref ws ,(+ (* x 8) v))))
                                                                    ,(+ dct-shift 2)))))
                                          (declare (type fixnum s))
@@ -2204,7 +2204,7 @@ makes a block reduced to SIZExSIZE samples."
            #+cl-jpeg-neon (ignorable ws))
   (cond ((or (zerop last) (= size 1))
          ;; same result as the full transform of a DC-only block
-         (let ((s (plus 127 (descale (ash (aref block 0) 1) 4))))
+         (let ((s (plus 128 (descale (ash (aref block 0) 1) 4))))
            (declare (type fixnum s))
            (let ((sample (if (logtest s -256) (if (minusp s) 0 255) s)))
              (declare (type uint8 sample))
@@ -2839,7 +2839,7 @@ or returns NIL if they are the same"
         (setf (aref xmap x) (floor (* x num) den))))))
 
 ;;; YCbCr to RGB conversion coefficients, 16-bit fixed point. Samples are
-;;; level shifted by 127, as in the IDCT, so the chroma is centered on 127.
+;;; level shifted by 128, so the chroma is centered on 128.
 (defconstant +cr-r+ 91881)  ; 1.402
 (defconstant +cb-g+ -22554) ; -0.34414
 (defconstant +cr-g+ -46802) ; -0.71414
@@ -2862,7 +2862,7 @@ horizontally subsampled by two."
                `(neon:make-u8.16 ,@(loop for j below 16
                                          for g = (+ (* 16 m) j)
                                          collect (if (= (mod g 3) c) (floor g 3) 255)))))
-    (let ((k127 (neon:s16.8-broadcast 127))
+    (let ((k128 (neon:s16.8-broadcast 128))
           (k0 (neon:s16.8-broadcast 0))
           (k255 (neon:s16.8-broadcast 255))
           (half-unit (neon:s32.4-broadcast 32768))
@@ -2904,8 +2904,8 @@ horizontally subsampled by two."
                                (let ((c (neon:u8.16-aref pcr (plus rcr (ash x -1))))) (neon:u8.16-zip-even c c))
                                (neon:u8.16-aref pcr (plus rcr x))))
                      (ylo (lo y16)) (yhi (hi y16))
-                     (cblo (neon:s16.8- (lo cb16) k127)) (cbhi (neon:s16.8- (hi cb16) k127))
-                     (crlo (neon:s16.8- (lo cr16) k127)) (crhi (neon:s16.8- (hi cr16) k127))
+                     (cblo (neon:s16.8- (lo cb16) k128)) (cbhi (neon:s16.8- (hi cb16) k128))
+                     (crlo (neon:s16.8- (lo cr16) k128)) (crhi (neon:s16.8- (hi cr16) k128))
                      (b (pack (neon:s16.8+ ylo (term cblo kcbb cblo k0-32)) (neon:s16.8+ yhi (term cbhi kcbb cbhi k0-32))))
                      (g (pack (neon:s16.8+ ylo (term cblo kcbg crlo kcrg)) (neon:s16.8+ yhi (term cbhi kcbg crhi kcrg))))
                      (r (pack (neon:s16.8+ ylo (term crlo kcrr crlo k0-32)) (neon:s16.8+ yhi (term crhi kcrr crhi k0-32)))))
@@ -3004,8 +3004,8 @@ band the planes hold when they are strips, else 0."
                   (loop for x fixnum from vector-width below width
                         for p fixnum from (plus out (mul vector-width 3)) by 3
                         for yy fixnum = (plus 256 (aref py (plus ry (aref my x))))
-                        for cb fixnum = (minus (aref pcb (plus rcb (aref mcb x))) 127)
-                        for cr fixnum = (minus (aref pcr (plus rcr (aref mcr x))) 127) do
+                        for cb fixnum = (minus (aref pcb (plus rcb (aref mcb x))) 128)
+                        for cr fixnum = (minus (aref pcr (plus rcr (aref mcr x))) 128) do
                         (setf (aref buffer p) ; BLUE
                               (aref clamp (plus yy (ycc-term cb +cb-b+))))
                         (setf (aref buffer (plus p 1)) ; GREEN
