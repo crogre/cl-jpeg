@@ -88,3 +88,28 @@ probably faster (no full-image coefficient pass, better locality).
 ## Worklog
 
 (entries are added as experiments complete)
+
+### 2026-11-01 — Experiment 1: MCU rows — done (`exp/1-mcu-rows`, 148bd79)
+
+Planes hold one band (MCU row) when the first scan of a sequential frame
+covers all components (it is then the only scan). `map-scan-blocks`
+calls a band-done hook after the last block of each band, which writes
+that band to the output (`output-band` -> `output-rows`). One-scan-per-
+component sequential frames and progressive frames keep whole-image
+planes. Column maps are now prepared once per frame.
+
+| image | stb MB | before MB | exp1 MB |
+|---|---|---|---|
+| base420 2048 | 18.9 | 19.0 | **12.7** |
+| base444 2048 | 25.2 | 25.3 | **12.8** |
+| gray 2048 | 8.4 | 8.4 | **4.3** |
+| base420 4000x3000 | 54.1 | — | **36.3** |
+| prog420 2048 | 31.5 | 31.6 | 31.6 (unchanged, see exp 4) |
+
+Speed: unchanged within noise (two runs; base420 2048 21.0-21.6 ms vs
+20.6, base444 66.7-67.3 vs 67.0, gray 14.6 vs 14.4). The expected cache
+locality gain did not show up; the planes were apparently not a
+bottleneck. All checks pass (354/354 images, SIMD color exact).
+
+Found: a truncated file signals END-OF-FILE (from the byte reader), on
+the base branch too. To handle in the robustness work.
