@@ -1281,8 +1281,14 @@
        '(0  0  0  0  0  0  0  0)
        '(0  0  0  0  0  0  0  0))
       :type sint16-2d-array)	; Temporary workspace for IDCT
+  ;; Input: bytes SOURCE-POS below SOURCE-END of SOURCE are next. BYTE-READER
+  ;; refills SOURCE and returns the new end, or 0 when there is no more data.
   (byte-reader #'(lambda () ;in case setup fails somehow
 		   (error 'jpeg-decoder-error)) :type function)
+  (source (make-array 0 :element-type 'uint8) :type uint8-array)
+  (source-pos 0 :type fixnum)
+  (source-end 0 :type fixnum)
+  (stream-buffer nil)       ; chunk buffer for reading file streams
   (source-cache)
   (adobe-app14-transform nil)
   (progressive-p nil)       ; t when decoding SOF2 (progressive) frame
@@ -1348,7 +1354,57 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
 
 (defun read-jpeg-byte (image)
   (declare #.*optimize*)
-  (the uint8 (funcall (descriptor-byte-reader image))))
+  (let ((pos (descriptor-source-pos image)))
+    (declare (type fixnum pos))
+    (when (>= pos (descriptor-source-end image))
+      (setf pos (refill-source image)))
+    (setf (descriptor-source-pos image) (1+ pos))
+    (aref (descriptor-source image) pos)))
+
+(defun refill-source (image)
+  "Refills the input buffer and returns the position of its first byte"
+  (let ((end (funcall (descriptor-byte-reader image))))
+    (declare (type fixnum end))
+    (when (zerop end)
+      (error 'end-of-file :stream nil))
+    (setf (descriptor-source-end image) end
+          (descriptor-source-pos image) 0)))
+
+(defun set-source (image stream cached-source-p)
+  "Sets up the input of IMAGE: the source cache, a file stream read in
+chunks, or another stream read byte by byte"
+  (cond (cached-source-p
+         (when (or (not (typep (descriptor-source-cache image) 'uint8-array))
+                   (and (typep stream 'file-stream)
+                        (< (length (descriptor-source-cache image)) (file-length stream))))
+           (setf (descriptor-source-cache image) (make-array (file-length stream) :element-type 'uint8)))
+         (when stream ;; NULL stream means the cache in descriptor is already read
+           (read-sequence (descriptor-source-cache image) stream))
+         (setf (descriptor-source image) (descriptor-source-cache image)
+               (descriptor-source-end image) (length (descriptor-source-cache image))
+               (descriptor-byte-reader image) (lambda () 0)))
+        ;; Seekable streams are read in chunks; RELEASE-SOURCE moves the
+        ;; position back to just after the data used
+        ((and (typep stream 'file-stream) (file-position stream))
+         (unless (descriptor-stream-buffer image)
+           (setf (descriptor-stream-buffer image) (make-array 32768 :element-type 'uint8)))
+         (let ((buffer (descriptor-stream-buffer image)))
+           (setf (descriptor-source image) buffer
+                 (descriptor-source-end image) 0
+                 (descriptor-byte-reader image) (lambda () (read-sequence buffer stream)))))
+        (t
+         (let ((buffer (make-array 1 :element-type 'uint8)))
+           (setf (descriptor-source image) buffer
+                 (descriptor-source-end image) 0
+                 (descriptor-byte-reader image)
+                 (lambda () (setf (aref buffer 0) (read-byte stream)) 1)))))
+  (setf (descriptor-source-pos image) 0))
+
+(defun release-source (image stream)
+  "Leaves a chunk-read STREAM positioned just after the data decoded"
+  (when (and stream (eq (descriptor-source image) (descriptor-stream-buffer image)))
+    (file-position stream (- (file-position stream)
+                             (- (descriptor-source-end image) (descriptor-source-pos image))))))
 
 ;;; Reads an JPEG marker from the stream
 (defun read-marker (s)
@@ -2667,28 +2723,8 @@ Supports both baseline and progressive DCT-based JPEGs."
     (loop for scan across (descriptor-scans descriptor) do ;required if we reuse descriptors
 	 (setf (scan-x scan) 0
 	       (scan-y scan) 0)))
-  (let* ((image (or descriptor (make-descriptor)))
-	 (pos 0))
-    (cond (cached-source-p
-           (when (or (not (typep (descriptor-source-cache image) 'array))
-                     (and (typep stream 'file-stream) (< (length (descriptor-source-cache image)) (file-length stream))))
-             (setf (descriptor-source-cache image) (make-array (file-length stream) :element-type 'uint8)))
-           (when stream ;; NULL stream means the cache in descriptor is already read
-             (read-sequence (descriptor-source-cache image) stream))
-           (let ((cache (descriptor-source-cache image)))
-             (setf (descriptor-byte-reader image)
-                   #'(lambda ()
-                       (declare #.*optimize*
-                                (type uint8-array cache)
-                                (type fixnum pos))
-                       (prog1 (aref cache pos) (incf pos))))))
-          ;; if descriptor is NULL or the descriptor's byte-reader is
-          ;; NULL, set it here.
-          ((or (not descriptor)
-               (not (descriptor-byte-reader descriptor)))
-           (setf (descriptor-byte-reader image)
-                 #'(lambda ()
-                     (read-byte stream)))))
+  (let ((image (or descriptor (make-descriptor))))
+    (set-source image stream cached-source-p)
      (unless (= (read-marker image) +M_SOI+)
       (error 'unrecognized-file-format))
      (let ((marker (interpret-markers image 0)))
@@ -2709,6 +2745,7 @@ Supports both baseline and progressive DCT-based JPEGs."
                       (= +M_SOF2+ marker))
                   (decode-frame-beginning image nil))
                  (t (error 'unsupported-jpeg-format :code marker)))))
+     (release-source image stream)
      (values (when decode-frame
                (descriptor-buffer image))
              (descriptor-height image)
