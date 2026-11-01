@@ -2561,6 +2561,17 @@ marker that ends it"
                             data (descriptor-source image)))
                     (aref data pos))))
       (loop
+        #+sbcl
+        ;; skip 8 bytes at a time while none of them is #xff
+        (loop while (and (zerop (logand pos 7)) (<= (+ pos 8) end))
+              do (let* ((word (lognot (sb-kernel:%vector-raw-bits data (ash pos -3))))
+                        (word (logand word #xffffffffffffffff)))
+                   (declare (type (unsigned-byte 64) word))
+                   ;; a zero byte of the complement is a #xff byte of the data
+                   (unless (zerop (logand (logand (- word #x0101010101010101) #xffffffffffffffff)
+                                          (lognot word) #x8080808080808080))
+                     (return))
+                   (incf pos 8)))
         (when (= (next-byte) #xff)
           (loop do (incf pos) ; skipping fill bytes
                 while (= (next-byte) #xff))
@@ -2760,8 +2771,8 @@ planes, and clears them for the next band."
               (declare (type fixnum offset last))
               (dotimes (k 64)
                 (let ((coef (aref coef-buf (plus offset k))))
-                  (unless (zerop coef) (setf last k))
-                  (setf (aref block (aref natural k)) (mul coef (aref qz k)))))
+                  (setf last (if (zerop coef) last k) ; branchless: zeros are unpredictable
+                        (aref block (aref natural k)) (mul coef (aref qz k)))))
               (idct-block block ws plane (plus (mul (mul row size) stride) (mul col size)) stride last size))))
         (fill coef-buf 0)))))
 
