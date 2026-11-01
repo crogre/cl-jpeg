@@ -20,6 +20,12 @@ for sz in 512x512 1024x1024 2048x2048 4000x3000; do
   cjpeg -quality 85 -sample 2x2 -progressive img/src.ppm > img/prog420_$sz.jpg
   cjpeg -quality 85 -sample 2x2 -progressive -restart 1 img/src.ppm > img/prog420rst_$sz.jpg
 done
+# Smooth content (many blocks with few or no AC coefficients)
+for sz in 512x512 1024x1024 2048x2048 4000x3000; do
+  [ -f img/smooth420_$sz.jpg ] && continue
+  magick -size $sz plasma:fractal -seed 11 -blur 0x4 \( -size $sz gradient:white-navy \) -compose multiply -composite img/src.ppm
+  cjpeg -quality 85 -sample 2x2 img/src.ppm > img/smooth420_$sz.jpg
+done
 rm -f img/src.ppm img/src.pgm
 
 # Correctness images with djpeg reference output: odd sizes, all sampling
