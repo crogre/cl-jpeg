@@ -1300,6 +1300,9 @@
   (next-band 0 :type fixnum) ; first band not yet written to the output buffer
   (xmaps nil)               ; per-component output column -> plane column maps
   (convert-p nil)           ; t when YCbCr may be converted to BGR on output
+  (ycck-p nil)              ; t when YCCK is to be converted to CMYK on output
+  (row-callback nil)        ; called for each output row instead of filling a whole image
+  (buffer-row0 0 :type fixnum) ; image row stored at the start of BUFFER
   (hmax 1 :type fixnum)     ; maximum sampling factors
   (vmax 1 :type fixnum)
   (mcus-x 0 :type fixnum)   ; MCUs per row and column
@@ -2674,8 +2677,9 @@ planes, and clears them for the next band."
 ;;; Progressive frame decoding subroutine
 (defun decode-progressive-frame (image buffer)
   "Decode a progressive JPEG frame (SOF2), one band at a time."
-  (decode-frame-beginning image buffer)
+  (decode-frame-beginning image)
   (read-frame-components image)
+  (allocate-output image buffer)
   (setf (descriptor-progressive-p image) t)
   (let* ((cursors (read-progressive-scans image))
          ;; the input as left after EOI, restored when the bands are done
@@ -2821,8 +2825,33 @@ horizontally subsampled by two."
 (defun output-band (image band)
   "Writes the output rows of BAND (an MCU row) from the strip planes"
   (let ((y0 (* band 8 (descriptor-vmax image))))
-    (output-rows image y0 (min (descriptor-height image) (+ y0 (* 8 (descriptor-vmax image)))) band)
+    (emit-rows image y0 (min (descriptor-height image) (+ y0 (* 8 (descriptor-vmax image)))) band)
     (setf (descriptor-next-band image) (1+ band))))
+
+(defun output-image (image)
+  "Writes the whole image from whole-image planes, a band of rows at a time
+when rows are passed to a callback"
+  (let ((height (descriptor-height image)))
+    (if (descriptor-row-callback image)
+        (loop with step = (* 8 (descriptor-vmax image))
+              for y0 from 0 below height by step
+              do (emit-rows image y0 (min height (+ y0 step)) 0))
+        (emit-rows image 0 height 0))))
+
+(defun emit-rows (image y0 y1 band)
+  "Produces output rows Y0 below Y1 from the planes (holding BAND when they
+are strips): writes them to the output buffer, converts YCCK if needed, and
+passes them to the row callback if there is one."
+  (let ((callback (descriptor-row-callback image)))
+    (when callback
+      (setf (descriptor-buffer-row0 image) y0))
+    (output-rows image y0 y1 band)
+    (when (descriptor-ycck-p image)
+      (ycck-cmyk-convert image (- y0 (descriptor-buffer-row0 image)) (- y1 (descriptor-buffer-row0 image))))
+    (when callback
+      (loop with row-bytes = (* (descriptor-width image) (descriptor-ncomp image))
+            for y from y0 below y1
+            do (funcall callback (descriptor-buffer image) (* (- y y0) row-bytes) y)))))
 
 (defun output-rows (image y0 y1 band)
   "Interleaves rows Y0 below Y1 of the component planes into the output buffer,
@@ -2867,7 +2896,7 @@ band the planes hold when they are strips, else 0."
                      (type fixnum hmax hy hc vector-width)
                      (ignorable hmax hy hc))
             (loop for y fixnum from y0 below y1
-                  for out fixnum from (mul y0 (mul width 3)) by (mul width 3)
+                  for out fixnum from (mul (minus y0 (descriptor-buffer-row0 image)) (mul width 3)) by (mul width 3)
                   for ry fixnum = (plane-row 0 y)
                   for rcb fixnum = (plane-row 1 y)
                   for rcr fixnum = (plane-row 2 y) do
@@ -2891,7 +2920,8 @@ band the planes hold when they are strips, else 0."
               (declare (type uint8-array plane)
                        (type fixnum-array xmap))
               (loop for y fixnum from y0 below y1
-                    for out fixnum from (plus (mul y0 (mul width ncomp)) c) by (mul width ncomp)
+                    for out fixnum from (plus (mul (minus y0 (descriptor-buffer-row0 image)) (mul width ncomp)) c)
+                      by (mul width ncomp)
                     for row fixnum = (plane-row c y) do
                     (if (and (= ncomp 1) (= (the fixnum (aref (descriptor-H image) c)) (descriptor-hmax image)))
                         (replace buffer plane :start1 out :start2 row :end2 (plus row width))
@@ -2899,14 +2929,15 @@ band the planes hold when they are strips, else 0."
                               for p fixnum from out by ncomp do
                               (setf (aref buffer p) (aref plane (plus row (aref xmap x)))))))))))))
 
-(defun ycck-cmyk-convert (image)
+(defun ycck-cmyk-convert (image &optional (start 0) (end (descriptor-height image)))
+  "Converts rows START below END of the output buffer from YCCK to CMYK"
   (let* ((buffer (descriptor-buffer image))
          (nw (mul (descriptor-width image) 4)))
     (declare #.*optimize*
 	     (type (simple-array uint8 (*)) buffer)
-             (type fixnum nw))
-    (loop for y fixnum from 0 below (descriptor-height image)
-       for yp fixnum from 0 by nw do
+             (type fixnum nw start end))
+    (loop for y fixnum from start below end
+       for yp fixnum from (mul start nw) by nw do
 	 (loop for x fixnum from 0 below (descriptor-width image)
 	    for py fixnum from yp by 4
 	    for pu fixnum = (1+ py)
@@ -2952,28 +2983,37 @@ band the planes hold when they are strips, else 0."
 	      :element-type 'uint8
 	      :initial-element 0))
 
-(defun decode-frame-beginning (image buffer)
+(defun decode-frame-beginning (image)
+  "Reads the frame header up to the component specifications"
   (read-jpeg-byte image) ; length
   (read-jpeg-byte image)
   (read-jpeg-byte image) ; sample precision
-  (let ((height (read-word image))
-        (width (read-word image))
-        (ncomp (read-jpeg-byte image)))
-    (if (arrayp buffer)
-        (if (< (length buffer) (* (setf (descriptor-height image) height)
-                                  (setf (descriptor-width image) width)
-                                  (setf (descriptor-ncomp image) ncomp)))
-            (error 'invalid-buffer-supplied :buffer buffer)
-            (setf (descriptor-buffer image) buffer))
-        (setf (descriptor-buffer image)
-              (allocate-buffer (setf (descriptor-height image) height)
-                               (setf (descriptor-width image) width)
-                               (setf (descriptor-ncomp image) ncomp))))))
+  (setf (descriptor-height image) (read-word image)
+        (descriptor-width image) (read-word image)
+        (descriptor-ncomp image) (read-jpeg-byte image)))
+
+(defun allocate-output (image buffer)
+  "Sets up the output buffer: BUFFER if given, else a new one for the whole
+image, or for one band of rows when rows are passed to a callback"
+  (let ((size (* (descriptor-height image) (descriptor-width image) (descriptor-ncomp image))))
+    (setf (descriptor-buffer-row0 image) 0
+          (descriptor-buffer image)
+          (cond ((descriptor-row-callback image)
+                 (allocate-buffer (min (descriptor-height image) (* 8 (descriptor-vmax image)))
+                                  (descriptor-width image) (descriptor-ncomp image)))
+                ((arrayp buffer)
+                 (when (< (length buffer) size)
+                   (error 'invalid-buffer-supplied :buffer buffer))
+                 buffer)
+                (t
+                 (allocate-buffer (descriptor-height image) (descriptor-width image)
+                                  (descriptor-ncomp image)))))))
 
 ;;; Frame decoding subroutine
 (defun decode-frame (image buffer)
-  (decode-frame-beginning image buffer)
+  (decode-frame-beginning image)
   (read-frame-components image)
+  (allocate-output image buffer)
   (loop with term fixnum = 0
         until (= term +M_EOI+) do
         (when (/= (interpret-markers image term) +M_SOS+)
@@ -2983,11 +3023,17 @@ band the planes hold when they are strips, else 0."
       ;; bands a truncated scan did not complete
       (loop for band from (descriptor-next-band image) below (descriptor-mcus-y image)
             do (output-band image band))
-      (output-rows image 0 (descriptor-height image) 0)))
+      (output-image image)))
 
-(defun decode-stream (stream &key buffer (colorspace-conversion t) descriptor cached-source-p (decode-frame t))
+(defun decode-stream (stream &key buffer (colorspace-conversion t) descriptor cached-source-p (decode-frame t)
+                               row-callback)
   "Return image array, height, width, number of components and APP14 Adobe transform.
-Supports both baseline and progressive DCT-based JPEGs."
+Supports both baseline and progressive DCT-based JPEGs. With ROW-CALLBACK, no
+image array is made: the function is called with a buffer, a start index and
+the row number for each row of the image, top to bottom, the row's samples
+being the next width x ncomp bytes from the start index. The buffer is reused,
+so the samples are only valid during the call, and NIL is returned in place of
+the image array."
   (when (and (null stream) (not cached-source-p))
     (error 'invalid-buffer-supplied))
   (when descriptor
@@ -3001,22 +3047,22 @@ Supports both baseline and progressive DCT-based JPEGs."
      (let ((marker (interpret-markers image 0)))
        (if decode-frame
            (let ((ycck (eql (descriptor-adobe-app14-transform image) :ycck-cmyk)))
-             (setf (descriptor-convert-p image) (and colorspace-conversion (not ycck)))
+             (setf (descriptor-convert-p image) (and colorspace-conversion (not ycck))
+                   (descriptor-ycck-p image) (and colorspace-conversion ycck)
+                   (descriptor-row-callback image) row-callback)
              (cond ((= +M_SOF0+ marker)
                     (decode-frame image buffer))
                    ((= +M_SOF2+ marker)
                     (decode-progressive-frame image buffer))
-                   (t (error 'unsupported-jpeg-format :code marker)))
-             (when (and colorspace-conversion ycck)
-               (ycck-cmyk-convert image)))
+                   (t (error 'unsupported-jpeg-format :code marker))))
            ;; decode-frame-beginning supports baselnie DCT frames
            ;; and progressive DCT frames, so allow those
            (cond ((or (= +M_SOF0+ marker)
                       (= +M_SOF2+ marker))
-                  (decode-frame-beginning image nil))
+                  (decode-frame-beginning image))
                  (t (error 'unsupported-jpeg-format :code marker)))))
      (release-source image stream)
-     (values (when decode-frame
+     (values (when (and decode-frame (not row-callback))
                (descriptor-buffer image))
              (descriptor-height image)
              (descriptor-width image)
@@ -3024,13 +3070,15 @@ Supports both baseline and progressive DCT-based JPEGs."
              (descriptor-adobe-app14-transform image))))
 
 ;;; Top level decoder function
-(defun decode-image (filename &key buffer (colorspace-conversion t) cached-source-p (decode-frame t))
+(defun decode-image (filename &key buffer (colorspace-conversion t) cached-source-p (decode-frame t)
+                                 row-callback)
   (with-open-file (in filename :direction :input :element-type 'uint8)
     (decode-stream in
                    :buffer buffer
                    :colorspace-conversion colorspace-conversion
                    :cached-source-p cached-source-p
-                   :decode-frame decode-frame)))
+                   :decode-frame decode-frame
+                   :row-callback row-callback)))
 
 (defun decode-stream-height-width-ncomp (stream &key descriptor cached-source-p)
   "Return the height and width of the JPEG data read from STREAM. Does less work than
