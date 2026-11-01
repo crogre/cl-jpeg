@@ -113,3 +113,32 @@ bottleneck. All checks pass (354/354 images, SIMD color exact).
 
 Found: a truncated file signals END-OF-FILE (from the byte reader), on
 the base branch too. To handle in the robustness work.
+
+### 2026-11-01 — Experiment 2: input + Huffman — done (`exp/2-input-huffman`, c206672, 282a04e)
+
+2a (c206672): `read-jpeg-byte` reads from a buffer in the descriptor instead
+of calling a closure per byte. Source cache = buffer; file streams are
+read in 32 KB chunks and repositioned after the data used at the end
+(checked: two concatenated JPEGs decode from one stream); other streams
+byte by byte. Default `decode-image` is now as fast as in-memory
+decoding (base444 2048: 75 -> 68 ms). In-memory speed unchanged.
+
+2b (282a04e): `with-local-bits` keeps the bit buffer in locals for a whole
+block (libjpeg-turbo's fast path idea), in the sequential block decoder
+and all four progressive decoders. The refinement correction helper was
+a closure call per bit and is now a macro, which explains much of the
+progressive gain.
+
+| image (2048x2048) | stb ms | before ms | exp2 ms | vs stb |
+|---|---|---|---|---|
+| base420 | 25.3 | 20.6 | 20.2 | 0.80x |
+| base444 | 67.2 | 67.0 | 59.3 | 0.88x |
+| gray | 15.2 | 14.4 | 13.5 | 0.88x |
+| prog420 | 50.2 | 57.6 | **41.9** | 0.83x |
+| prog420 4000x3000 | 142.4 | 171.0 | 121.6 | 0.85x |
+
+Every variant is now faster than scalar stb_image. Memory unchanged
+(plus a 32 KB chunk buffer when reading file streams). All checks pass.
+Also bounded the coefficient index in `decode-ac-first` against corrupt
+data.
+
