@@ -1785,14 +1785,16 @@ work like PEEK-BITS, SKIP-BITS, GET-BITS and HUFF-DECODE."
         (setf (aref qz k) (u8ref q (mod n 8) (floor n 8)))))))
 
 ;;; Decodes single 8x8 block
-(defun decode-block (block dc-table ac-table qz br s preds comp)
+(defun decode-block (block dc-table ac-table qz br s preds comp limit)
   "Reads one 8x8 block into BLOCK, dequantized and in natural order, and
-returns the zigzag index of its last coefficient set. BLOCK must be all zero."
+returns the zigzag index of its last coefficient set. BLOCK must be all zero.
+Coefficients beyond zigzag index LIMIT are decoded but not stored (a scaled
+inverse DCT does not use them)."
   (declare #.*optimize*
            (type sint32-array block)
            (type fixnum-array qz)
            (type (simple-array sint16 (*)) preds)
-           (type fixnum comp))
+           (type fixnum comp limit))
   (with-local-bits (br s)
     ;; DC coefficient
     (let* ((tt (min 16 (the fixnum (huff dc-table))))
@@ -1812,8 +1814,9 @@ returns the zigzag index of its last coefficient set. BLOCK must be all zero."
                    (progn (skip (logand fast 15))
                           (incf k (logand (ash fast -4) 15))
                           (let ((z (logand k 63)))
-                            (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))
-                                  last z))
+                            (when (<= z limit)
+                              (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))
+                                    last z)))
                           (incf k))
                    (let* ((rs (huff ac-table))
                           (ssss (logand rs 15))
@@ -1824,10 +1827,11 @@ returns the zigzag index of its last coefficient set. BLOCK must be all zero."
                                 (incf k 16)
                                 (return last)))
                            (t (incf k r)
-                              (let ((z (logand k 63)))
-                                (setf (aref block (aref natural z))
-                                      (mul (extend (bits ssss) ssss) (aref qz z))
-                                      last z))
+                              (let ((z (logand k 63))
+                                    (value (extend (bits ssss) ssss)))
+                                (when (<= z limit)
+                                  (setf (aref block (aref natural z)) (mul value (aref qz z))
+                                        last z)))
                               (incf k))))))
           finally (return last))))
 
@@ -2400,7 +2404,7 @@ marker that terminated the scan, or 0 if it ended cleanly."
             (t (return term))))))
 
 ;;; Reads and decodes either whole scan or restart interval
-(defun decode-chunk (image scan comps total-units dc-tables ac-tables dequant)
+(defun decode-chunk (image scan comps total-units dc-tables ac-tables dequant limits)
   "Decodes one restart interval of a sequential scan (or the whole scan) into the component planes"
   (let ((br (make-bitreader))
         (preds (make-array (length comps) :initial-element 0 :element-type 'sint16))
@@ -2412,7 +2416,7 @@ marker that terminated the scan, or 0 if it ended cleanly."
         (sizes (descriptor-comp-sizes image))
         (natural +zigzag-natural+))
     (declare #.*optimize*
-             (type simple-vector dc-tables ac-tables dequant planes bpr sizes)
+             (type simple-vector dc-tables ac-tables dequant limits planes bpr sizes)
              (type fixnum-array natural)
              (type (simple-array sint16 (*)) preds))
     (flet ((decode-one (sc c row col)
@@ -2423,7 +2427,7 @@ marker that terminated the scan, or 0 if it ended cleanly."
                    (prow (if strip (mod row (the fixnum (aref (descriptor-V image) c))) row)))
                (declare (type fixnum size stride prow))
                (let ((last (decode-block block (svref dc-tables sc) (svref ac-tables sc)
-                                         (svref dequant sc) br image preds sc)))
+                                         (svref dequant sc) br image preds sc (svref limits sc))))
                  (declare (type fixnum last))
                  (idct-block block ws (svref planes c)
                              (plus (mul (mul prow size) stride) (mul col size)) stride last size)
@@ -2878,14 +2882,15 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
          (ac-tables (map 'simple-vector
                          (lambda (cd) (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))
                          (subseq (scan-cdesc scan) 0 (length comps))))
-         (dequant (map 'simple-vector (lambda (c) (dequant-table image c)) comps)))
+         (dequant (map 'simple-vector (lambda (c) (dequant-table image c)) comps))
+         (limits (map 'simple-vector (lambda (c) (scaled-coefficient-limit image (vector c))) comps)))
     (unless (descriptor-planes image)
       ;; A scan of all components is the only scan of a sequential frame, so it
       ;; can be decoded and output one band at a time
       (allocate-planes image (= (length comps) (descriptor-ncomp image))))
     (decode-scan-intervals image scan
                            (lambda () (decode-chunk image scan comps total-units
-                                                    dc-tables ac-tables dequant)))))
+                                                    dc-tables ac-tables dequant limits)))))
 
 ;;; Function that bounds value in 0..255 range
 (defun limit (n)
