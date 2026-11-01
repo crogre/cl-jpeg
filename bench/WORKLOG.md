@@ -303,3 +303,44 @@ encoded by cl-jpeg (q 95) decodes 0.59 levels dark on average with both
 djpeg and the fixed cl-jpeg decoder (the round trip was -1.57 before the
 decoder fix). Not investigated; separate from the decoder work.
 
+### 2026-11-01 — Follow-ups — done (`exp/5-combined`, 3d3a10a, ce90a1e, d2d0e70)
+
+**Band overhead** (3d3a10a). Phase timing of a 2048x2048 progressive decode:
+entropy decoding (`advance-cursor`) 31 ms, `finalize-band` 9.5 ms,
+output 4.3 ms, pre-parse ~1.5 ms (mostly building Huffman tables, which
+every path does). Made the last-coefficient tracking in `finalize-band`
+branchless and the marker scan in `skip-entropy-data` 8 bytes at a time:
+~1%. Re-measured experiment 2 alone under the same conditions: 41.9 vs
+44.0 ms at 2048x2048 (5%), 124.5 vs 125.0 ms at 12 MP (0.5%), so the
+remaining gap is small and not per band; left as is.
+
+**NEON 4x4** (ce90a1e). The 4x4 reduced IDCT for 1/2 is generated as NEON
+code from the same table (each coefficient row a vector: 16 vector
+multiply-adds per pass, 4x4 transpositions). Exact vs the scalar 4x4
+(`idct-check.lisp` now covers it). 1/2 is faster than full size:
+
+| 2048x2048 | full | 1/2 before | 1/2 now |
+|---|---|---|---|
+| base444 | 59.7 | 63.1 | **52.7** |
+| base420 | 19.5 | 18.1 | **15.2** |
+| prog420 | 44.8 | 43.4 | **39.5** |
+| smooth420 | 9.3 | 9.4 | **6.4** |
+
+**Unused coefficients** (d2d0e70). Scaled sequential decoding no longer
+stores coefficients beyond those its block size uses (they are still
+decoded): base444 2048 1/4 50.2 -> 46.8 ms, 1/8 49.1 -> 44.9 ms; full
+size unchanged.
+
+Current state (`exp/5-combined`, 2048x2048 unless noted):
+
+| image | stb ms / MB | cl-jpeg ms / MB | ratio |
+|---|---|---|---|
+| base420 | 25.2 / 18.9 | 19.5 / 12.7 | 0.77x |
+| base444 | 66.3 / 25.2 | 60.3 / 12.8 | 0.91x |
+| gray | 15.1 / 8.4 | 13.3 / 4.3 | 0.88x |
+| prog420 | 49.6 / 31.5 | 43.7 / 12.9 | 0.88x |
+| smooth420 | 16.5 / 18.9 | 9.1 / 12.7 | 0.55x |
+| prog420 4000x3000 | 142.0 / 90.2 | 126.1 / 36.5 | 0.89x |
+
+Remaining open item: the encoder bias (above).
+
