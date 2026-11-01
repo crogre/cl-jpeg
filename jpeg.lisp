@@ -69,9 +69,9 @@
 
 (declaim (inline csize quantize get-average zigzag read-jpeg-byte
                  llm-dct descale crunch colorspace-convert subsample inverse-llm-dct
-                 dequantize extend peek-bits skip-bits get-bits huff-decode
+                 dequantize extend
                  decode-block idct-block
-                 write-bits limit))
+                 write-bits))
 
 (deftype uint8 () '(unsigned-byte 8))
 (deftype uint8-array () '(simple-array uint8 (*)))
@@ -532,6 +532,25 @@
   ((reason :reader invalid-jpeg-data-reason :initarg :reason))
   (:report (lambda (condition stream)
 	     (format stream "Invalid JPEG data: ~A" (invalid-jpeg-data-reason condition)))))
+
+(defmacro clamp-sample (x)
+  "X clamped to 0..255"
+  `(let ((v ,x))
+     (declare (type fixnum v))
+     (if (logtest v -256) (if (minusp v) 0 255) v)))
+
+(defmacro store-8-bytes (vector index word)
+  "Stores the 64-bit WORD little-endian as the 8 bytes of the octet VECTOR
+starting at INDEX, which must be a multiple of 8"
+  #+sbcl `(setf (sb-kernel:%vector-raw-bits ,vector (ash ,index -3)) ,word)
+  #-sbcl `(let ((v ,vector) (i ,index) (w ,word))
+            (dotimes (k 8) (setf (aref v (+ i k)) (ldb (byte 8 (* 8 k)) w)))))
+
+#+sbcl
+(defmacro load-8-bytes (vector index)
+  "Returns the 8 bytes of the octet VECTOR from INDEX (a multiple of 8) as a
+little-endian 64-bit word"
+  `(sb-kernel:%vector-raw-bits ,vector (ash ,index -3)))
 
 (defmacro wrap16 (x)
   "X wrapped to a signed 16-bit value, as stored in 16-bit coefficient arrays
@@ -1233,8 +1252,7 @@ before use, as the decoder is compiled without runtime checks."
 ;;; Contains all information about a single scan
 (defstruct scan
   (ncomp 1 :type fixnum) ; number of image components in the scan
-  (x 0 :type fixnum) ; current processing
-  (y 0 :type fixnum) ; positions
+  (x 0 :type fixnum) ; data units decoded
   (cdesc (make-array 4
                      :initial-contents (loop repeat 4 collect (list 0 0)))
          :type (simple-array t (*))) ; descriptors of all components in the scan
@@ -1272,31 +1290,17 @@ before use, as the decoder is compiled without runtime checks."
                         (make-array 8 :initial-contents
                                     (loop for i fixnum from 0 to 7
                                           collecting (make-array 8 :element-type 'uint8))))) :type (simple-array uint8-2d-array (*)))
-  (huff-ac (make-array 4 :initial-contents
+  (dc-huffman-tables (make-array 4 :initial-contents
                        (loop repeat 4 collect (make-huffstruct))) :type (simple-array t (*)))
-  (huff-dc (make-array 4 :initial-contents
+  (ac-huffman-tables (make-array 4 :initial-contents
                        (loop repeat 4 collect (make-huffstruct))) :type (simple-array t (*)))
   (cid (make-array 4) :type (simple-array t (*)))
-  (scans (make-array 4 :initial-contents
-                     (loop for i fixnum from 0 to 3 collecting (make-scan))) :type (simple-array t (*)))
   (H (make-array 4) :type (simple-array t (*)))
   (V (make-array 4) :type (simple-array t (*)))
-  (iH (make-array 4) :type (simple-array t (*)))
-  (iV (make-array 4) :type (simple-array t (*)))
   (qdest (make-array 4) :type (simple-array t (*)))
   (coefs (make-array 64 :element-type '(signed-byte 32)) :type sint32-array) ; block being decoded
   (idct-ws (make-array 64 :element-type 'fixnum) :type fixnum-array) ; IDCT workspace
   (ncomp 0 :type fixnum)
-  (ws (2d-sint16-array
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0)
-       '(0  0  0  0  0  0  0  0))
-      :type sint16-2d-array)	; Temporary workspace for IDCT
   ;; Input: bytes SOURCE-POS below SOURCE-END of SOURCE are next. BYTE-READER
   ;; refills SOURCE and returns the new end, or 0 when there is no more data.
   (byte-reader #'(lambda () ;in case setup fails somehow
@@ -1307,7 +1311,6 @@ before use, as the decoder is compiled without runtime checks."
   (stream-buffer nil)       ; chunk buffer for reading file streams
   (source-cache)
   (adobe-app14-transform nil)
-  (progressive-p nil)       ; t when decoding SOF2 (progressive) frame
   (coef-buffers nil)        ; vector of per-component sint16 arrays for DCT coefficients
   (blocks-per-row nil)      ; vector of per-component block-row counts
   (blocks-per-col nil)      ; vector of per-component block-column counts
@@ -1577,8 +1580,8 @@ chunks, or another stream read byte by byte"
           for tables = (progn
                          (check-data (and (<= tc 1) (<= th 3)) "Huffman table class ~D, index ~D" tc th)
                          (if (zerop tc)
-                             (aref (descriptor-huff-ac image) th)
-                             (aref (descriptor-huff-dc image) th)))
+                             (aref (descriptor-dc-huffman-tables image) th)
+                             (aref (descriptor-ac-huffman-tables image) th)))
           for bits = (huffstruct-bits tables)
           for sum fixnum = 0 do
           (loop for i fixnum from 0 to 15
@@ -1696,34 +1699,6 @@ chunks, or another stream read byte by byte"
                 (logand (logior (ash (bitreader-buf br) 8) b) #xffffffffffffffff))
           (incf (bitreader-cnt br) 8))))
 
-(defun peek-bits (br s n)
-  "Returns the next N (at most 16) bits without consuming them"
-  (declare #.*optimize*
-           (type bitreader br)
-           (type (integer 0 16) n))
-  (when (< (bitreader-cnt br) n)
-    (fill-bits br s))
-  (logand (ash (bitreader-buf br) (- (the (integer 0 64) (- (bitreader-cnt br) n))))
-          (1- (ash 1 n))))
-
-(defun skip-bits (br n)
-  "Consumes N bits, throwing the pending marker if they run past the data"
-  (declare #.*optimize*
-           (type bitreader br)
-           (type (integer 0 17) n))
-  (let ((cnt (- (bitreader-cnt br) n)))
-    (when (< cnt (bitreader-pad br))
-      (throw 'marker (bitreader-marker br)))
-    (setf (bitreader-cnt br) cnt)))
-
-;;; Recieves n bits from the stream
-(defun get-bits (br s n)
-  "Reads N (at most 16) bits from the stream"
-  (declare #.*optimize*
-           (type (integer 0 16) n))
-  (prog1 (peek-bits br s n)
-    (skip-bits br n)))
-
 ;;; The DECODE procedure, for codes longer than the 9-bit lookup table
 (defun huff-decode-slow (table code16)
   "Decodes the Huffman code at the start of the 16 bits CODE16. Returns the
@@ -1743,26 +1718,12 @@ value and the code length (17 for an invalid code)."
             do (return (values (aref huffval (plus (aref valptr l) (minus code (aref mincode l)))) l))
           finally (return (values 0 17)))))
 
-;;; The DECODE procedure, with a table lookup for codes of up to 9 bits
-(defun huff-decode (table br s)
-  "Decodes one Huffman-coded value"
-  (declare #.*optimize*
-           (type huffstruct table))
-  (let* ((code16 (peek-bits br s 16))
-         (entry (aref (huffstruct-lookup table) (ash code16 -7))))
-    (declare (type (unsigned-byte 16) code16 entry))
-    (if (/= entry 0)
-        (progn (skip-bits br (ash entry -8))
-               (logand entry 255))
-        (multiple-value-bind (value length) (huff-decode-slow table code16)
-          (skip-bits br length)
-          value))))
-
 ;;; The same operations on a bit buffer held in local variables
 (defmacro with-local-bits ((br s) &body body)
   "Evaluates BODY with the bit buffer of BR in local variables, written back
-when BODY returns. Within BODY, (PEEK N), (SKIP N), (BITS N) and (HUFF TABLE)
-work like PEEK-BITS, SKIP-BITS, GET-BITS and HUFF-DECODE."
+when BODY returns. Within BODY, (PEEK N) returns the next N (at most 16) bits,
+(SKIP N) consumes N bits (throwing the pending marker if they run past the
+data), (BITS N) does both and (HUFF TABLE) decodes one Huffman-coded value."
   (let ((buf (gensym "BUF")) (cnt (gensym "CNT")))
     `(let ((,buf (bitreader-buf ,br))
            (,cnt (bitreader-cnt ,br)))
@@ -2064,9 +2025,7 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
   (macrolet ((mulc (x c) `(mul ,x ,c))
              (shl (x) `(ash ,x dct-shift))
              (sample (v) ; level shift and clamp
-               `(let ((s (plus ,v 128)))
-                  (declare (type fixnum s))
-                  (if (logtest s -256) (if (minusp s) 0 255) s))))
+               `(clamp-sample (plus ,v 128))))
     (dotimes (col 8) ; iterating over columns
       (macrolet ((in (row) `(aref block (plus ,(* row 8) col)))
                  (out (row v) `(setf (aref ws (plus ,(* row 8) col)) ,v)))
@@ -2094,6 +2053,20 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
                   (out 2 (descale o2 +shift+4+)) (out 3 (descale o3 +shift+4+))
                   (out 4 (descale o4 +shift+4+)) (out 5 (descale o5 +shift+4+))
                   (out 6 (descale o6 +shift+4+)) (out 7 (descale o7 +shift+4+))))))))
+
+#+cl-jpeg-neon
+(declaim (inline neon-transpose4))
+#+cl-jpeg-neon
+(defun neon-transpose4 (r0 r1 r2 r3)
+  "Transposes the 4x4 matrix whose rows are R0..R3, returning its columns"
+  (let ((t0 (neon:s64.2! (neon:s32.4-transpose-even r0 r1)))
+        (t1 (neon:s64.2! (neon:s32.4-transpose-odd r0 r1)))
+        (t2 (neon:s64.2! (neon:s32.4-transpose-even r2 r3)))
+        (t3 (neon:s64.2! (neon:s32.4-transpose-odd r2 r3))))
+    (values (neon:s32.4! (neon:s64.2-transpose-even t0 t2))
+            (neon:s32.4! (neon:s64.2-transpose-even t1 t3))
+            (neon:s32.4! (neon:s64.2-transpose-odd t0 t2))
+            (neon:s32.4! (neon:s64.2-transpose-odd t1 t3)))))
 
 #+cl-jpeg-neon
 (defmacro neon-idct-block (block plane pos stride &optional sparse)
@@ -2134,7 +2107,7 @@ quarter, a row pass and a transposition back. SPARSE means only the top left
                  (if (every (lambda (j) (eql (ref src (+ (* 4 g) j) h) 0)) '(0 1 2 3))
                      body ; a zero tile stays zero (marked above)
                      `(multiple-value-bind ,(loop for j below 4 collect (ref dst (+ (* 4 h) j) g))
-                          (transpose4 ,@(loop for j below 4 collect (ref src (+ (* 4 g) j) h)))
+                          (neon-transpose4 ,@(loop for j below 4 collect (ref src (+ (* 4 g) j) h)))
                         ,body)))
                (transpose-all (src dst body)
                  (transpose src dst 0 0 (transpose src dst 0 1 (transpose src dst 1 0 (transpose src dst 1 1 body))))))
@@ -2147,22 +2120,13 @@ quarter, a row pass and a transposition back. SPARSE means only the top left
                     (sample (v) `(neon:s32.4-shiftr
                                   (neon:s32.4+ ,v (neon:s32.4-broadcast ,(+ (ash 1 (1- +shift+4+)) (ash 128 +shift+4+))))
                                   +shift+4+)))
-           (flet ((transpose4 (r0 r1 r2 r3)
-                    (let ((t0 (neon:s64.2! (neon:s32.4-transpose-even r0 r1)))
-                          (t1 (neon:s64.2! (neon:s32.4-transpose-odd r0 r1)))
-                          (t2 (neon:s64.2! (neon:s32.4-transpose-even r2 r3)))
-                          (t3 (neon:s64.2! (neon:s32.4-transpose-odd r2 r3))))
-                      (values (neon:s32.4! (neon:s64.2-transpose-even t0 t2))
-                              (neon:s32.4! (neon:s64.2-transpose-even t1 t3))
-                              (neon:s32.4! (neon:s64.2-transpose-odd t0 t2))
-                              (neon:s32.4! (neon:s64.2-transpose-odd t1 t3)))))
-                  (row-bytes (lo hi)
+           (flet ((row-bytes (lo hi)
                     ;; 8 samples of a row, clamped to 0..255, as u16.8
                     (neon:u16.8! (neon:s16.8-max (neon:s16.8-broadcast 0)
                                                  (neon:s16.8-min (neon:s16.8-broadcast 255)
                                                                  (neon:s16.8-from-s32.4-saturating-hi
                                                                   (neon:s16.8-from-s32.4-saturating lo) hi))))))
-             (declare (inline transpose4 row-bytes))
+             (declare (inline row-bytes))
              ,(columns 0 (columns 1 (transpose-all p q
                 (rows 0 (rows 1 (transpose-all o r
                   `(progn
@@ -2173,8 +2137,8 @@ quarter, a row pass and a transposition back. SPARSE means only the top left
                                                          (neon:u8.16-from-u16.8 (row-bytes ,(ref r row 0) ,(ref r row 1)))
                                                          (row-bytes ,(ref r (1+ row) 0) ,(ref r (1+ row) 1)))))
                                         ;; 8 byte stores: block rows are 8-aligned in the plane
-                                        (setf (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,row ,stride)) -3)) a
-                                              (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,(1+ row) ,stride)) -3)) b))))))))))))))))
+                                        (store-8-bytes ,plane (plus ,pos (mul ,row ,stride)) a)
+                                        (store-8-bytes ,plane (plus ,pos (mul ,(1+ row) ,stride)) b))))))))))))))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun scaled-idct-table (n)
@@ -2185,7 +2149,7 @@ the block reduced by 8/N (direct DCT scaling, as in libjpeg)"
       (dotimes (x n table)
         (dotimes (u n)
           (setf (aref table (+ (* x n) u))
-                (round (* (ash 1 dct-shift) 1/2 (if (zerop u) (sqrt 1/2) 1)
+                (round (* (ash 1 dct-shift) 1/2 (if (zerop u) (sqrt 0.5d0) 1)
                           (cos (/ (* (1+ (* 2 x)) u pi) (* 2 n)))))))))))
 
 (defmacro define-reduced-idct (name n)
@@ -2212,12 +2176,11 @@ in PLANE at POS, rows STRIDE apart" n)
          ;; rows
          ,@(loop for x below n
                  append (loop for y below n
-                              collect `(let ((s (plus 128 (descale ,(dot (loop for v below n collect (aref table (+ (* y n) v)))
-                                                                         (loop for v below n collect `(aref ws ,(+ (* x 8) v))))
-                                                                   ,(+ dct-shift 2)))))
-                                         (declare (type fixnum s))
-                                         (setf (aref plane (plus pos ,(if (zerop x) y `(plus (mul ,x stride) ,y))))
-                                               (if (logtest s -256) (if (minusp s) 0 255) s)))))
+                              collect `(setf (aref plane (plus pos ,(if (zerop x) y `(plus (mul ,x stride) ,y))))
+                                             (clamp-sample
+                                              (plus 128 (descale ,(dot (loop for v below n collect (aref table (+ (* y n) v)))
+                                                                       (loop for v below n collect `(aref ws ,(+ (* x 8) v))))
+                                                                 ,(+ dct-shift 2)))))))
          nil))))
 
 (define-reduced-idct idct-4x4-scalar 4)
@@ -2228,7 +2191,8 @@ in PLANE at POS, rows STRIDE apart" n)
   "Defines NAME as IDCT-4X4-SCALAR done with NEON: each coefficient row is one
 vector, so each pass is 16 vector multiply-adds, with 4x4 transpositions
 between and after them"
-  (let ((table (scaled-idct-table 4)))
+  (let ((table (scaled-idct-table 4))
+        (samples (loop repeat 16 collect (gensym "SAMPLE"))))
     (labels ((dot (coefs vectors)
                ;; sum of constant times vector
                (reduce (lambda (a b) `(neon:s32.4+ ,a ,b))
@@ -2241,28 +2205,19 @@ in PLANE at POS, rows STRIDE apart"
                   (type sint32-array block)
                   (type uint8-array plane)
                   (type fixnum pos stride))
-         (flet ((transpose4 (r0 r1 r2 r3)
-                  (let ((t0 (neon:s64.2! (neon:s32.4-transpose-even r0 r1)))
-                        (t1 (neon:s64.2! (neon:s32.4-transpose-odd r0 r1)))
-                        (t2 (neon:s64.2! (neon:s32.4-transpose-even r2 r3)))
-                        (t3 (neon:s64.2! (neon:s32.4-transpose-odd r2 r3))))
-                    (values (neon:s32.4! (neon:s64.2-transpose-even t0 t2))
-                            (neon:s32.4! (neon:s64.2-transpose-even t1 t3))
-                            (neon:s32.4! (neon:s64.2-transpose-odd t0 t2))
-                            (neon:s32.4! (neon:s64.2-transpose-odd t1 t3))))))
-           (declare (inline transpose4))
+         (progn
            (let ((r0 (neon:s32.4-aref block 0)) (r1 (neon:s32.4-aref block 8))
                  (r2 (neon:s32.4-aref block 16)) (r3 (neon:s32.4-aref block 24))
                  (pass1-round (neon:s32.4-broadcast ,(ash 1 (- dct-shift 3))))
                  (pass2-round (neon:s32.4-broadcast ,(+ (ash 1 (+ dct-shift 1)) (ash 128 (+ dct-shift 2))))))
              ;; columns: row X of the output from the coefficient rows, keeping 2 extra bits
              (multiple-value-bind (c0 c1 c2 c3)
-                 (transpose4 ,@(loop for x below 4
+                 (neon-transpose4 ,@(loop for x below 4
                                      collect `(neon:s32.4-shiftr (neon:s32.4+ ,(dot (row x) '(r0 r1 r2 r3)) pass1-round)
                                                                  ,(- dct-shift 2))))
                ;; rows: column Y of the output, level shifted, then back to rows
                (multiple-value-bind (o0 o1 o2 o3)
-                   (transpose4 ,@(loop for y below 4
+                   (neon-transpose4 ,@(loop for y below 4
                                        collect `(neon:s32.4-shiftr (neon:s32.4+ ,(dot (row y) '(c0 c1 c2 c3)) pass2-round)
                                                                    ,(+ dct-shift 2))))
                  (flet ((clamped (a b)
@@ -2271,13 +2226,13 @@ in PLANE at POS, rows STRIDE apart"
                                                                        (neon:s16.8-from-s32.4-saturating-hi
                                                                         (neon:s16.8-from-s32.4-saturating a) b))))))
                    (declare (inline clamped))
-                   (multiple-value-bind (s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15)
+                   (multiple-value-bind ,samples
                        (neon:u8.16-values (neon:u8.16-from-u16.8-hi (neon:u8.16-from-u16.8 (clamped o0 o1))
                                                                     (clamped o2 o3)))
                      ,@(loop for x below 4
                              append (loop for y below 4
                                           collect `(setf (aref plane (plus pos ,(if (zerop x) y `(plus (mul ,x stride) ,y))))
-                                                         ,(intern (format nil "S~D" (+ (* x 4) y)))))))))))
+                                                         ,(nth (+ (* x 4) y) samples)))))))))
            nil)))))
 
 #+cl-jpeg-neon
@@ -2298,21 +2253,15 @@ makes a block reduced to SIZExSIZE samples."
            #+cl-jpeg-neon (ignorable ws))
   (cond ((or (zerop last) (= size 1))
          ;; same result as the full transform of a DC-only block
-         (let ((s (plus 128 (descale (ash (aref block 0) 1) 4))))
-           (declare (type fixnum s))
-           (let ((sample (if (logtest s -256) (if (minusp s) 0 255) s)))
-             (declare (type uint8 sample))
-             (if (= size 8)
-                 #+sbcl
-                 (let ((word (* sample #x0101010101010101)))
-                   (dotimes (row 8)
-                     (setf (sb-kernel:%vector-raw-bits plane (ash (plus pos (mul row stride)) -3)) word)))
-                 #-sbcl
+         (let ((sample (clamp-sample (plus 128 (descale (ash (aref block 0) 1) 4)))))
+           (declare (type uint8 sample))
+           (if (= size 8)
+               (let ((word (* sample #x0101010101010101)))
                  (dotimes (row 8)
-                   (fill plane sample :start (plus pos (mul row stride)) :end (plus pos (plus (mul row stride) 8))))
-                 (dotimes (row size)
-                   (dotimes (col size)
-                     (setf (aref plane (plus pos (plus (mul row stride) col))) sample)))))))
+                   (store-8-bytes plane (plus pos (mul row stride)) word)))
+               (dotimes (row size)
+                 (dotimes (col size)
+                   (setf (aref plane (plus pos (plus (mul row stride) col))) sample))))))
         ((= size 4)
          #+cl-jpeg-neon (idct-4x4-neon block plane pos stride)
          #-cl-jpeg-neon (idct-4x4-scalar block ws plane pos stride))
@@ -2337,11 +2286,10 @@ makes a block reduced to SIZExSIZE samples."
 (defun scan-table (image scan i class)
   "Returns the Huffman table of class :DC or :AC that SCAN uses for its Ith
 component, which must have been defined"
-  ;; huff-ac stores DC tables (tc=0), huff-dc stores AC tables (tc=1)
   (let* ((selectors (second (aref (scan-cdesc scan) i)))
          (table (if (eq class :dc)
-                    (aref (descriptor-huff-ac image) (ash selectors -4))
-                    (aref (descriptor-huff-dc image) (logand selectors 15)))))
+                    (aref (descriptor-dc-huffman-tables image) (ash selectors -4))
+                    (aref (descriptor-ac-huffman-tables image) (logand selectors 15)))))
     (check-data (huffstruct-maxcode table) "scan uses an undefined Huffman table")
     table))
 
@@ -2678,7 +2626,7 @@ marker that ends it"
         #+sbcl
         ;; skip 8 bytes at a time while none of them is #xff
         (loop while (and (zerop (logand pos 7)) (<= (+ pos 8) end))
-              do (let* ((word (lognot (sb-kernel:%vector-raw-bits data (ash pos -3))))
+              do (let* ((word (lognot (load-8-bytes data pos)))
                         (word (logand word #xffffffffffffffff)))
                    (declare (type (unsigned-byte 64) word))
                    ;; a zero byte of the complement is a #xff byte of the data
@@ -2905,7 +2853,6 @@ planes, and clears them for the next band."
   (decode-frame-beginning image)
   (read-frame-components image)
   (allocate-output image buffer)
-  (setf (descriptor-progressive-p image) t)
   (let* ((cursors (read-progressive-scans image))
          ;; the input as left after EOI, restored when the bands are done
          (source (descriptor-source image))
@@ -2946,12 +2893,6 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
     (decode-scan-intervals image scan
                            (lambda () (decode-chunk image scan comps total-units
                                                     dc-tables ac-tables dequant limits)))))
-
-;;; Function that bounds value in 0..255 range
-(defun limit (n)
-  (cond ((> n 254) 255)
-        ((< n 1) 0)
-        (t n)))
 
 ;;; Clamps v+256 to 0..255, for v in -256..511
 (declaim (type uint8-array +clamp-table+))
@@ -3177,15 +3118,15 @@ band the planes hold when they are strips, else 0."
 	    for cb fixnum = (aref buffer pu)
 	    for cr fixnum = (aref buffer pv) do
 	      (setf (aref buffer pv)	; BLUE
-		    (the uint8 (limit (minus +max-sample+ (plus yy (aref +cb-b-tab+ cb))))))
+		    (the uint8 (clamp-sample (minus +max-sample+ (plus yy (aref +cb-b-tab+ cb))))))
 	      (setf (aref buffer pu)	; GREEN
-		    (the uint8 (limit (minus +max-sample+
+		    (the uint8 (clamp-sample (minus +max-sample+
 					     (plus yy (ash (plus
 							    (aref +cb-g-tab+ cb)
 							    (aref +cr-g-tab+ cr))
 							   (- shift)))))))
 	      (setf (aref buffer py)	; RED
-		    (the uint8 (limit (minus +max-sample+ (plus yy (aref +cr-r-tab+ cr))))))))))
+		    (the uint8 (clamp-sample (minus +max-sample+ (plus yy (aref +cr-r-tab+ cr))))))))))
 
 (defun convert-cmyk-to-rgb (buffer h w &key rgb-buffer)
   (unless rgb-buffer
@@ -3277,10 +3218,6 @@ reduced inverse DCTs; the returned height and width are those of the scaled
 image, rounded up."
   (when (and (null stream) (not cached-source-p))
     (error 'invalid-buffer-supplied))
-  (when descriptor
-    (loop for scan across (descriptor-scans descriptor) do ;required if we reuse descriptors
-	 (setf (scan-x scan) 0
-	       (scan-y scan) 0)))
   (check-type scale (member 1 1/2 1/4 1/8))
   (let ((image (or descriptor (make-descriptor))))
     (setf (descriptor-block-size image) (* 8 scale))
