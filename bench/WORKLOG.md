@@ -20,10 +20,10 @@ Branches, for comparing implementations afterwards:
 
 | experiment | branch | based on |
 |---|---|---|
-| 1. MCU rows | `exp/1-mcu-rows` | `3b9e4c6` |
-| 2. input + Huffman | `exp/2-input-huffman` | `3b9e4c6` |
-| 3. sparse IDCT | `exp/3-sparse-idct` | `3b9e4c6` |
-| 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-row output) |
+| 1. MCU rows | `exp/1-mcu-rows` | `648f502` |
+| 2. input + Huffman | `exp/2-input-huffman` | `648f502` |
+| 3. sparse IDCT | `exp/3-sparse-idct` | `648f502` |
+| 4. progressive bands | `exp/4-progressive-bands` | `exp/1-mcu-rows` (reuses its per-band output) |
 | 5. optional features | `exp/5-*` | decided later |
 
 Experiment branches hold only code; this worklog and the results live
@@ -89,7 +89,7 @@ probably faster (no full-image coefficient pass, better locality).
 
 (entries are added as experiments complete)
 
-### 2026-11-01 — Experiment 1: MCU rows — done (`exp/1-mcu-rows`, 148bd79)
+### 2026-11-01 — Experiment 1: MCU rows — done (`exp/1-mcu-rows`, 4b42564)
 
 Planes hold one band (MCU row) when the first scan of a sequential frame
 covers all components (it is then the only scan). `map-scan-blocks`
@@ -114,16 +114,16 @@ bottleneck. All checks pass (354/354 images, SIMD color exact).
 Found: a truncated file signals END-OF-FILE (from the byte reader), on
 the base branch too. To handle in the robustness work.
 
-### 2026-11-01 — Experiment 2: input + Huffman — done (`exp/2-input-huffman`, c206672, 282a04e)
+### 2026-11-01 — Experiment 2: input + Huffman — done (`exp/2-input-huffman`, f7efc59, 6cc27a8)
 
-2a (c206672): `read-jpeg-byte` reads from a buffer in the descriptor instead
+2a (f7efc59): `read-jpeg-byte` reads from a buffer in the descriptor instead
 of calling a closure per byte. Source cache = buffer; file streams are
 read in 32 KB chunks and repositioned after the data used at the end
 (checked: two concatenated JPEGs decode from one stream); other streams
 byte by byte. Default `decode-image` is now as fast as in-memory
 decoding (base444 2048: 75 -> 68 ms). In-memory speed unchanged.
 
-2b (282a04e): `with-local-bits` keeps the bit buffer in locals for a whole
+2b (6cc27a8): `with-local-bits` keeps the bit buffer in locals for a whole
 block (libjpeg-turbo's fast path idea), in the sequential block decoder
 and all four progressive decoders. The refinement correction helper was
 a closure call per bit and is now a macro, which explains much of the
@@ -141,4 +141,72 @@ Every variant is now faster than scalar stb_image. Memory unchanged
 (plus a 32 KB chunk buffer when reading file streams). All checks pass.
 Also bounded the coefficient index in `decode-ac-first` against corrupt
 data.
+
+(Commit ids above are after rebasing the experiment branches onto
+`648f502`, which added smooth 4:2:0 benchmark images.)
+
+### 2026-11-01 — Experiment 3: sparse IDCT — done (`exp/3-sparse-idct`, e96dbb6)
+
+The block decoders return the zigzag index of the last coefficient set.
+DC-only blocks become a constant fill (same result as the transform);
+on NEON, blocks with coefficients only in the top left 4x4 (zigzag index
+<= 9) use a sparse variant generated from the same macros:
+`llm-idct-1d` now folds literal zero inputs at expansion time, and the
+NEON macro skips the right half of the column pass and zero tiles.
+Blocks are cleared only where coefficients were set when sparse
+(`fill` otherwise: scattered clearing of dense blocks cost 5-7% on the
+noisy images in a first version).
+
+| image (2048x2048) | stb ms | base ms | exp3 ms |
+|---|---|---|---|
+| smooth420 | 16.5 | 12.3 | **10.1** |
+| smooth420 4000x3000 | 46.5 | 35.9 | **25.5** |
+| base420 | 25.2 | 20.3 | 20.8 |
+| base444 | 66.3 | 65.6 | 65.0 |
+| gray | 15.1 | 14.9 | 14.1 |
+| prog420 | 49.6 | 58.7 | 59.5 |
+
+Smooth images (typical of photos with sky, skin, out-of-focus areas)
+gain 17-29%; noisy ones are unchanged within noise. Memory unchanged.
+`idct-check.lisp` now covers DC-only and top-left-only blocks (300000
+random blocks, exact). All checks pass.
+
+Note on method: all tests run in fresh SBCL processes (write, compile,
+test), since the hot code is inline functions and macros that a REPL
+would leave stale in their callers.
+
+### 2026-11-01 — Experiment 4: progressive bands — done (`exp/4-progressive-bands`, 643f601)
+
+Based on `exp/1-mcu-rows` (uses its strip planes and `output-band`).
+`read-progressive-scans` reads all scans up to EOI, keeping per scan a
+cursor with its header, copies of the Huffman tables in effect (DHT can
+change between scans), its restart interval and its entropy-coded data
+(copied into one buffer, terminating marker kept so the bit reader
+stops). Each band is then decoded from every scan in turn
+(`advance-cursor`: resumes position, bit reader, EOB run, DC predictors;
+handles RSTn at interval ends and resyncs on early ones), then
+dequantized/IDCT'd into the strip planes and output. Coefficient
+buffers are one band high. All 354 images pass on the first run,
+including progressive files with every restart setting.
+
+| image | stb MB | before MB | exp4 MB |
+|---|---|---|---|
+| prog420 2048 | 31.5 | 31.6 | **14.9** |
+| prog420 4000x3000 | 90.2 | 90.4 | **40.6** |
+
+(Allocation measured; part of the excess over the 12.6/36 MB output is
+garbage from growing the scan data buffer by doubling, so the true peak
+is a bit lower.)
+
+Speed: prog420 2048 58.7 -> 63.1 ms (+7%), 4000x3000 168 -> 179 ms. The
+expected locality gain did not appear. The cost is input handling on
+this branch: copying the scan data (~2.2 ms for 705 KB, measured) and
+reading it back through a per-cursor closure. With experiment 2's
+buffered source the copy can be skipped for in-memory sources and the
+cursors can read their buffer directly; re-measure when combining.
+
+Tooling note: sb-sprof attributes most samples to `ycc-to-bgr-neon` on
+these branches (93% for a baseline image where color conversion is a
+few ms), presumably for lack of debug info at (debug 0); timing phases
+directly is reliable, the flat profile currently is not.
 
