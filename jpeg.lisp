@@ -1351,12 +1351,12 @@ otherwise covering the whole image. Also prepares the output column maps."
                   'simple-vector))))
 
 (defun allocate-coef-buffers (image)
-  "Allocate per-component coefficient buffers for progressive decoding."
+  "Allocate per-component coefficient buffers for one band of a progressive frame."
   (let ((buffers (make-array (descriptor-ncomp image))))
     (dotimes (c (descriptor-ncomp image))
       (setf (aref buffers c)
             (make-array (* 64 (aref (descriptor-blocks-per-row image) c)
-                           (aref (descriptor-blocks-per-col image) c))
+                           (aref (descriptor-V image) c))
                         :element-type 'sint16 :initial-element 0)))
     (setf (descriptor-coef-buffers image) buffers)))
 
@@ -2311,40 +2311,127 @@ marker that terminated the scan, or 0 if it ended cleanly."
       ;; Normal completion (no EOB)
       0)))
 
-;;; Main progressive chunk decoder - processes one restart interval
-(defun decode-progressive-chunk (image scan comps total-units)
-  "Decode one restart interval of a progressive scan into coefficient buffers."
-  (let* ((br (make-bitreader))
-         (ncomp (scan-ncomp scan))
+;;; Progressive frames are decoded one band (MCU row) at a time: all scans
+;;; are read first, then each band is decoded from every scan in turn,
+;;; resuming each scan's decoder where the previous band left it. Only one
+;;; band of coefficients is held instead of the whole image.
+
+(defstruct (scan-cursor (:constructor make-scan-cursor
+                            (scan comps total-units tables restart-interval pos)))
+  "A progressive scan being decoded band by band"
+  scan
+  (comps nil :type (simple-array fixnum (*)))
+  (total-units 0 :type fixnum)
+  (tables #() :type simple-vector)  ; Huffman table of each scan component
+  (restart-interval 0 :type fixnum)
+  (pos 0 :type fixnum)              ; next byte of the scan's entropy-coded data
+  (reader nil)                      ; byte reader over the data, starting at POS
+  (br (make-bitreader) :type bitreader)
+  (preds (make-array 4 :element-type 'sint16 :initial-element 0) :type (simple-array sint16 (*)))
+  (eobrun 0 :type fixnum)
+  (done nil))                       ; t once the scan's data has run out
+
+(defun read-progressive-scans (image)
+  "Reads the scans of a progressive frame up to EOI. Returns a cursor for each
+scan, with its header, the Huffman tables and restart interval in effect, and
+its entropy-coded data, which is collected in one buffer."
+  (let ((data (make-array 65536 :element-type 'uint8))
+        (fill 0)
+        (cursors '()))
+    (declare (type uint8-array data)
+             (type fixnum fill))
+    (flet ((store (b)
+             (declare #.*optimize*
+                      (type uint8 b))
+             (when (= fill (length data))
+               (setf data (replace (make-array (* 2 (length data)) :element-type 'uint8) data)))
+             (setf (aref data fill) b)
+             (incf fill)))
+      (declare (inline store))
+      (loop with term fixnum = 0
+            for marker = (interpret-markers image term) do
+            (cond ((= marker +M_EOI+) (return))
+                  ((/= marker +M_SOS+) (error 'unsupported-jpeg-frame-marker)))
+            (let* ((scan (read-scan-header image))
+                   (comps (scan-components image scan))
+                   (dc-scan-p (zerop (scan-ss scan)))
+                   ;; copies, as DHT segments may redefine the tables for later scans
+                   (tables (map 'simple-vector
+                                (lambda (cd)
+                                  (copy-huffstruct
+                                   (if dc-scan-p
+                                       (aref (descriptor-huff-ac image) (ash (the fixnum (second cd)) -4))
+                                       (aref (descriptor-huff-dc image) (logand (the fixnum (second cd)) 15)))))
+                                (subseq (scan-cdesc scan) 0 (length comps)))))
+              (push (make-scan-cursor scan comps (scan-units image comps) tables
+                                      (descriptor-restart-interval image) fill)
+                    cursors)
+              ;; The entropy-coded data, including RSTn markers, up to the next
+              ;; marker, which is kept so that the bit reader stops there
+              (setf term
+                    (loop for b fixnum = (read-jpeg-byte image) do
+                          (if (/= b #xff)
+                              (store b)
+                              (let ((b2 (loop for b2 fixnum = (read-jpeg-byte image)
+                                              while (= b2 #xff)
+                                              finally (return b2))))
+                                (store #xff)
+                                (store b2)
+                                (unless (or (zerop b2) (<= +M_RST0+ b2 +M_RST7+))
+                                  (return b2)))))))))
+    (let ((cursors (nreverse cursors)))
+      (dolist (cursor cursors cursors)
+        (let ((cursor cursor))
+          (setf (scan-cursor-reader cursor)
+                (lambda ()
+                  (let ((pos (scan-cursor-pos cursor)))
+                    (declare #.*optimize*
+                             (type fixnum pos))
+                    (setf (scan-cursor-pos cursor) (1+ pos))
+                    (if (< pos fill) (aref data pos) 0)))))))))
+
+(defun scan-band-end (image cursor band)
+  "Returns the first data unit of CURSOR's scan beyond BAND"
+  (let ((comps (scan-cursor-comps cursor)))
+    (min (scan-cursor-total-units cursor)
+         (if (= (length comps) 1)
+             (multiple-value-bind (bw bh) (component-blocks image (aref comps 0))
+               (* bw (min bh (* (1+ band) (aref (descriptor-V image) (aref comps 0))))))
+             (* (1+ band) (descriptor-mcus-x image))))))
+
+(defun reset-cursor (cursor)
+  "Resets the decoder state of CURSOR, as at the start of a restart interval"
+  (setf (scan-cursor-br cursor) (make-bitreader)
+        (scan-cursor-eobrun cursor) 0)
+  (fill (scan-cursor-preds cursor) 0))
+
+(defun decode-scan-units (image cursor band end)
+  "Decodes the data units of CURSOR's scan up to END into the coefficient
+buffers of BAND."
+  (let* ((scan (scan-cursor-scan cursor))
+         (br (scan-cursor-br cursor))
          (ss (scan-ss scan))
          (se (scan-se scan))
          (al (scan-al scan))
          (dc-scan-p (and (zerop ss) (zerop se)))
          (first-scan-p (zerop (scan-ah scan)))
-         ;; huff-ac stores DC tables (tc=0), huff-dc stores AC tables (tc=1)
-         ;; For DC scans use Td (high nibble) to select DC table from huff-ac
-         ;; For AC scans use Ta (low nibble) to select AC table from huff-dc
-         (tables (coerce (loop for i fixnum from 0 below ncomp
-                               for tdta fixnum = (second (aref (scan-cdesc scan) i))
-                               collecting (if dc-scan-p
-                                              (aref (descriptor-huff-ac image) (ash tdta -4))
-                                              (aref (descriptor-huff-dc image) (logand tdta 15))))
-                         'simple-vector))
-         (preds (make-array ncomp :initial-element 0 :element-type 'sint16))
-         (eobrun 0)
+         (tables (scan-cursor-tables cursor))
+         (preds (scan-cursor-preds cursor))
+         (eobrun (scan-cursor-eobrun cursor))
          (coef-buffers (descriptor-coef-buffers image))
          (bpr (descriptor-blocks-per-row image)))
     (declare #.*optimize*
-             (type fixnum ncomp ss se al eobrun)
+             (type fixnum ss se al eobrun band)
              (type simple-vector tables coef-buffers bpr)
              (type (simple-array sint16 (*)) preds))
     (flet ((decode-one (sc c row col)
              (declare (type fixnum sc c row col))
-             (let ((coef-buf (svref coef-buffers c))
-                   (offset (mul 64 (plus (mul row (the fixnum (svref bpr c))) col)))
-                   (table (svref tables sc)))
+             (let* ((coef-buf (svref coef-buffers c))
+                    (band-row (minus row (mul band (the fixnum (aref (descriptor-V image) c)))))
+                    (offset (mul 64 (plus (mul band-row (the fixnum (svref bpr c))) col)))
+                    (table (svref tables sc)))
                (declare (type (simple-array sint16 (*)) coef-buf)
-                        (type fixnum offset))
+                        (type fixnum band-row offset))
                (cond
                  ;; DC first
                  ((and dc-scan-p first-scan-p)
@@ -2359,68 +2446,83 @@ marker that terminated the scan, or 0 if it ended cleanly."
                  (t
                   (setf eobrun (decode-ac-refine coef-buf offset ss se al table br image eobrun)))))))
       (declare (dynamic-extent #'decode-one))
-      (catch 'marker
-        (map-scan-blocks image scan comps (scan-x scan) (interval-end image scan total-units)
-                         #'decode-one)
-        (chunk-result scan br total-units)))))
+      (map-scan-blocks image scan (scan-cursor-comps cursor) (scan-x scan) end #'decode-one)
+      (setf (scan-cursor-eobrun cursor) eobrun))))
 
-;;; Reads SOS header and decodes one progressive scan
-(defun decode-progressive-scan (image)
-  "Read SOS header and decode one progressive scan into coefficient buffers.
-Returns the marker that terminated the scan, or 0 if it ended cleanly."
-  (let* ((scan (read-scan-header image))
-         (comps (scan-components image scan))
-         (total-units (scan-units image comps)))
-    (decode-scan-intervals image scan
-                           (lambda () (decode-progressive-chunk image scan comps total-units)))))
+(defun advance-cursor (image cursor band)
+  "Decodes the data units of CURSOR's scan that lie in BAND"
+  (let ((scan (scan-cursor-scan cursor))
+        (ri (scan-cursor-restart-interval cursor))
+        (end (scan-band-end image cursor band)))
+    (setf (descriptor-byte-reader image) (scan-cursor-reader cursor))
+    (loop until (or (scan-cursor-done cursor) (>= (scan-x scan) end)) do
+          (let* ((stop (if (zerop ri) end (min end (* (1+ (floor (scan-x scan) ri)) ri))))
+                 (result (catch 'marker
+                           (decode-scan-units image cursor band stop)
+                           :done)))
+            (cond ((eq result :done)
+                   ;; at the end of a restart interval, consume its RSTn marker
+                   (when (and (plusp ri) (zerop (mod (scan-x scan) ri))
+                              (< (scan-x scan) (scan-cursor-total-units cursor)))
+                     (unless (eq (bitreader-marker (scan-cursor-br cursor)) 'restart)
+                       (unless (<= +M_RST0+ (read-marker image) +M_RST7+)
+                         (setf (scan-cursor-done cursor) t)))
+                     (reset-cursor cursor)))
+                  ((and (eq result 'restart) (plusp ri))
+                   ;; RSTn met early (corrupt data): resync at the next interval
+                   (setf (scan-x scan) (* (1+ (floor (scan-x scan) ri)) ri))
+                   (reset-cursor cursor))
+                  (t ; the scan's data ended early
+                   (setf (scan-cursor-done cursor) t)))))))
 
-;;; Convert accumulated coefficients to pixel data
-(defun finalize-progressive (image)
-  "Dequantize and inverse transform the accumulated coefficients into the component planes."
+(defun finalize-band (image band dequant)
+  "Dequantizes and inverse transforms the coefficients of BAND into the strip
+planes, and clears them for the next band."
+  (declare (ignore band))
   (let ((block (descriptor-coefs image))
         (ws (descriptor-idct-ws image))
         (natural +zigzag-natural+))
     (declare #.*optimize*
              (type sint32-array block)
-             (type fixnum-array ws natural))
+             (type fixnum-array ws natural)
+             (type simple-vector dequant))
     (dotimes (c (descriptor-ncomp image))
       (let* ((coef-buf (aref (descriptor-coef-buffers image) c))
-             (qz (dequant-table image c))
+             (qz (svref dequant c))
              (bpr (aref (descriptor-blocks-per-row image) c))
-             (bpc (aref (descriptor-blocks-per-col image) c))
              (plane (aref (descriptor-planes image) c))
              (stride (mul 8 bpr)))
         (declare (type (simple-array sint16 (*)) coef-buf)
                  (type fixnum-array qz)
-                 (type fixnum bpr bpc stride))
-        (dotimes (row bpc)
+                 (type fixnum bpr stride))
+        (dotimes (row (aref (descriptor-V image) c))
           (dotimes (col bpr)
             (let ((offset (mul 64 (plus (mul row bpr) col))))
               (declare (type fixnum offset))
               (dotimes (k 64)
                 (setf (aref block (aref natural k))
                       (mul (aref coef-buf (plus offset k)) (aref qz k))))
-              (idct-block block ws plane (plus (mul (mul row 8) stride) (mul col 8)) stride))))))))
+              (idct-block block ws plane (plus (mul (mul row 8) stride) (mul col 8)) stride))))
+        (fill coef-buf 0)))))
 
 ;;; Progressive frame decoding subroutine
 (defun decode-progressive-frame (image buffer)
-  "Decode a progressive JPEG frame (SOF2)."
+  "Decode a progressive JPEG frame (SOF2), one band at a time."
   (decode-frame-beginning image buffer)
   (read-frame-components image)
   (setf (descriptor-progressive-p image) t)
-  (allocate-coef-buffers image)
-  (allocate-planes image nil)
-  ;; Process scans until EOI
-  (loop with term fixnum = 0 do
-        (let ((marker (interpret-markers image term)))
-          (cond ((= marker +M_SOS+)
-                 (setf term (or (decode-progressive-scan image) 0)))
-                ((= marker +M_EOI+)
-                 (return))
-                (t (error 'unsupported-jpeg-frame-marker)))))
-  ;; All scans done - finalize: IDCT into the component planes
-  (finalize-progressive image)
-  (output-rows image 0 (descriptor-height image) 0))
+  (let ((reader (descriptor-byte-reader image))
+        (cursors (read-progressive-scans image))
+        (dequant (coerce (loop for c below (descriptor-ncomp image) collect (dequant-table image c))
+                         'simple-vector)))
+    (allocate-coef-buffers image)
+    (allocate-planes image t)
+    (dotimes (band (descriptor-mcus-y image))
+      (dolist (cursor cursors)
+        (advance-cursor image cursor band))
+      (finalize-band image band dequant)
+      (output-band image band))
+    (setf (descriptor-byte-reader image) reader)))
 
 ;;; Scan decoding subroutine
 (defun decode-scan (image)
