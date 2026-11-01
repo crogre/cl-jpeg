@@ -5,3 +5,4 @@ results/
 stb_image.h
 stb_scalar
 stb_neon
+stb_mem
