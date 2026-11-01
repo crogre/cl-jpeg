@@ -1637,13 +1637,15 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
 
 ;;; Decodes AC coefficients
 (defun decode-ac (block table qz br s)
-  "Decodes AC coefficients into BLOCK, dequantized and in natural order"
+  "Decodes AC coefficients into BLOCK, dequantized and in natural order.
+Returns the zigzag index of the last coefficient set, 0 if none."
   (declare #.*optimize*
            (type sint32-array block)
            (type fixnum-array qz))
   (loop with fast-ac of-type (simple-array sint16 (512)) = (huffstruct-fast-ac table)
         with natural of-type fixnum-array = +zigzag-natural+
         with k fixnum = 1
+        with last fixnum = 0
         until (> k 63)
         do (let ((fast (aref fast-ac (peek-bits br s 9))))
              (declare (type fixnum fast))
@@ -1652,7 +1654,8 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
                  (progn (skip-bits br (logand fast 15))
                         (incf k (logand (ash fast -4) 15))
                         (let ((z (logand k 63)))
-                          (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))))
+                          (setf (aref block (aref natural z)) (mul (ash fast -8) (aref qz z))
+                                last z))
                         (incf k))
                  (let* ((rs (huff-decode table br s))
                         (ssss (logand rs 15))
@@ -1661,13 +1664,14 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
                    (cond ((zerop ssss)
                           (if (= r 15)
                               (incf k 16)
-                              (return)))
+                              (return last)))
                          (t (incf k r)
                             (let ((z (logand k 63)))
                               (setf (aref block (aref natural z))
-                                    (mul (extend (get-bits br s ssss) ssss) (aref qz z))))
-                            (incf k)))))))
-  block)
+                                    (mul (extend (get-bits br s ssss) ssss) (aref qz z))
+                                    last z))
+                            (incf k))))))
+        finally (return last)))
 
 ;;; Decodes DC value
 (defun decode-dc (table br s)
@@ -1679,13 +1683,13 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
 
 ;;; Decodes single 8x8 block
 (defun decode-block (block dc-table ac-table qz br s preds comp)
-  "Reads one 8x8 block into BLOCK, dequantized and in natural order"
+  "Reads one 8x8 block into BLOCK, dequantized and in natural order, and
+returns the zigzag index of its last coefficient set. BLOCK must be all zero."
   (declare #.*optimize*
            (type sint32-array block)
            (type fixnum-array qz)
            (type (simple-array sint16 (*)) preds)
            (type fixnum comp))
-  (fill block 0)
   (let ((dc (plus (aref preds comp) (decode-dc dc-table br s))))
     (setf (aref preds comp) dc
           (aref block 0) (mul dc (aref qz 0))))
@@ -1833,39 +1837,49 @@ i.e. the extent of a non-interleaved scan of it (A.2.2 of the spec)."
           (setf (aref row 4) (dct-limit (descale (minus tmp13 tmp0) +shift+4+))))))
 
 ;;; One-dimensional inverse LLM DCT, generic over the arithmetic used
-(defmacro llm-idct-1d ((add sub mulc shl) inputs outputs &body body)
+(defmacro llm-idct-1d ((add sub mulc shl zero) inputs outputs &body body)
   "Binds OUTPUTS to the 1-D inverse LLM DCT of the 8 INPUTS, scaled by
 2^dct-shift, and evaluates BODY. ADD, SUB, MULC (multiplication by a constant)
-and SHL (shift left by dct-shift) name the operators to use."
-  (let ((in (loop repeat 8 collect (gensym "IN")))
-        (tmp (loop repeat 17 collect (gensym "TMP"))))
-    (destructuring-bind (i0 i1 i2 i3 i4 i5 i6 i7) in
-      (destructuring-bind (z1 tmp2 tmp3 tmp0 tmp1 tmp10 tmp11 tmp12 tmp13 z5 z1b z2 z3 z4 t0 t1 t2) tmp
-        (let ((t3 (gensym "TMP")))
-          `(let* (,@(mapcar #'list in inputs)
-                  ;; even part
-                  (,z1 (,mulc (,add ,i2 ,i6) +FIX-0-541196100+))
-                  (,tmp2 (,add ,z1 (,mulc ,i6 (- +FIX-1-847759065+))))
-                  (,tmp3 (,add ,z1 (,mulc ,i2 +FIX-0-765366865+)))
-                  (,tmp0 (,shl (,add ,i0 ,i4)))
-                  (,tmp1 (,shl (,sub ,i0 ,i4)))
-                  (,tmp10 (,add ,tmp0 ,tmp3))
-                  (,tmp13 (,sub ,tmp0 ,tmp3))
-                  (,tmp11 (,add ,tmp1 ,tmp2))
-                  (,tmp12 (,sub ,tmp1 ,tmp2))
-                  ;; odd part
-                  (,z5 (,mulc (,add (,add ,i7 ,i3) (,add ,i5 ,i1)) +FIX-1-175875602+))
-                  (,z1b (,mulc (,add ,i7 ,i1) (- +FIX-0-899976223+)))
-                  (,z2 (,mulc (,add ,i5 ,i3) (- +FIX-2-562915447+)))
-                  (,z3 (,add (,mulc (,add ,i7 ,i3) (- +FIX-1-961570560+)) ,z5))
-                  (,z4 (,add (,mulc (,add ,i5 ,i1) (- +FIX-0-390180644+)) ,z5))
-                  (,t0 (,add (,mulc ,i7 +FIX-0-298631336+) (,add ,z1b ,z3)))
-                  (,t1 (,add (,mulc ,i5 +FIX-2-053119869+) (,add ,z2 ,z4)))
-                  (,t2 (,add (,mulc ,i3 +FIX-3-072711026+) (,add ,z2 ,z3)))
-                  (,t3 (,add (,mulc ,i1 +FIX-1-501321110+) (,add ,z1b ,z4)))
-                  ,@(mapcar #'list outputs
-                            `((,add ,tmp10 ,t3) (,add ,tmp11 ,t2) (,add ,tmp12 ,t1) (,add ,tmp13 ,t0)
-                              (,sub ,tmp13 ,t0) (,sub ,tmp12 ,t1) (,sub ,tmp11 ,t2) (,sub ,tmp10 ,t3))))
+and SHL (shift left by dct-shift) name the operators to use, and ZERO is a zero
+value. Inputs given as the literal 0 are folded away at expansion time."
+  (let ((bindings '()))
+    (labels ((bind (form)
+               (let ((var (gensym "TMP")))
+                 (push (list var form) bindings)
+                 var))
+             (zero-p (x) (eql x 0))
+             (add (x y) (cond ((zero-p x) y) ((zero-p y) x) (t (bind `(,add ,x ,y)))))
+             (sub (x y) (cond ((zero-p y) x) ((zero-p x) (bind `(,sub ,zero ,y))) (t (bind `(,sub ,x ,y)))))
+             (mulc (x c) (if (zero-p x) 0 (bind `(,mulc ,x ,c))))
+             (shl (x) (if (zero-p x) 0 (bind `(,shl ,x)))))
+      (destructuring-bind (i0 i1 i2 i3 i4 i5 i6 i7)
+          (mapcar (lambda (form) (if (zero-p form) 0 (bind form))) inputs)
+        (let* (;; even part
+               (z1 (mulc (add i2 i6) '+FIX-0-541196100+))
+               (tmp2 (add z1 (mulc i6 '(- +FIX-1-847759065+))))
+               (tmp3 (add z1 (mulc i2 '+FIX-0-765366865+)))
+               (tmp0 (shl (add i0 i4)))
+               (tmp1 (shl (sub i0 i4)))
+               (tmp10 (add tmp0 tmp3))
+               (tmp13 (sub tmp0 tmp3))
+               (tmp11 (add tmp1 tmp2))
+               (tmp12 (sub tmp1 tmp2))
+               ;; odd part
+               (z5 (mulc (add (add i7 i3) (add i5 i1)) '+FIX-1-175875602+))
+               (z1b (mulc (add i7 i1) '(- +FIX-0-899976223+)))
+               (z2 (mulc (add i5 i3) '(- +FIX-2-562915447+)))
+               (z3 (add (mulc (add i7 i3) '(- +FIX-1-961570560+)) z5))
+               (z4 (add (mulc (add i5 i1) '(- +FIX-0-390180644+)) z5))
+               (t0 (add (mulc i7 '+FIX-0-298631336+) (add z1b z3)))
+               (t1 (add (mulc i5 '+FIX-2-053119869+) (add z2 z4)))
+               (t2 (add (mulc i3 '+FIX-3-072711026+) (add z2 z3)))
+               (t3 (add (mulc i1 '+FIX-1-501321110+) (add z1b z4)))
+               (results (list (add tmp10 t3) (add tmp11 t2) (add tmp12 t1) (add tmp13 t0)
+                              (sub tmp13 t0) (sub tmp12 t1) (sub tmp11 t2) (sub tmp10 t3))))
+          `(let* (,@(reverse bindings)
+                  ,@(mapcar (lambda (out result) (list out (if (zero-p result) zero result)))
+                            outputs results))
+             (declare (ignorable ,@(mapcar #'first bindings)))
              ,@body))))))
 
 ;;; Inverse LLM DCT of a decoded block, written straight into a component plane
@@ -1890,7 +1904,7 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
                  (zerop (in 5)) (zerop (in 6)) (zerop (in 7)))
             (let ((dcval (ash (in 0) 1)))
               (dotimes (row 8) (setf (aref ws (plus (mul row 8) col)) dcval)))
-            (llm-idct-1d (plus minus mulc shl) ((in 0) (in 1) (in 2) (in 3) (in 4) (in 5) (in 6) (in 7))
+            (llm-idct-1d (plus minus mulc shl 0) ((in 0) (in 1) (in 2) (in 3) (in 4) (in 5) (in 6) (in 7))
                          (o0 o1 o2 o3 o4 o5 o6 o7)
               (out 0 (descale o0 +shift-1+)) (out 1 (descale o1 +shift-1+))
               (out 2 (descale o2 +shift-1+)) (out 3 (descale o3 +shift-1+))
@@ -1904,7 +1918,7 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
                      (zerop (in 5)) (zerop (in 6)) (zerop (in 7)))
                 (let ((dcval (sample (descale (in 0) 4))))
                   (fill plane dcval :start op :end (plus op 8)))
-                (llm-idct-1d (plus minus mulc shl) ((in 0) (in 1) (in 2) (in 3) (in 4) (in 5) (in 6) (in 7))
+                (llm-idct-1d (plus minus mulc shl 0) ((in 0) (in 1) (in 2) (in 3) (in 4) (in 5) (in 6) (in 7))
                              (o0 o1 o2 o3 o4 o5 o6 o7)
                   (out 0 (descale o0 +shift+4+)) (out 1 (descale o1 +shift+4+))
                   (out 2 (descale o2 +shift+4+)) (out 3 (descale o3 +shift+4+))
@@ -1912,31 +1926,46 @@ samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
                   (out 6 (descale o6 +shift+4+)) (out 7 (descale o7 +shift+4+))))))))
 
 #+cl-jpeg-neon
-(defmacro neon-idct-block (block plane pos stride)
+(defmacro neon-idct-block (block plane pos stride &optional sparse)
   "Expands into the inverse DCT of IDCT-BLOCK-SCALAR done four columns or rows at
 a time with NEON: a column pass over the block rows, a 4x4 transposition of each
-quarter, a row pass and a transposition back."
+quarter, a row pass and a transposition back. SPARSE means only the top left
+4x4 coefficients can be nonzero, so the work on the others is left out."
   (labels ((syms (prefix)
              (loop for i below 8 collect (loop for j below 2 collect (gensym (format nil "~A~D~D-" prefix i j)))))
            (ref (m i j) (nth j (nth i m))))
     (let ((p (syms "P")) (q (syms "Q")) (o (syms "O")) (r (syms "R"))
           (raw (loop repeat 8 collect (gensym "RAW"))))
+      (when sparse
+        ;; Known zeros, marked before the expansion is built: the right half of
+        ;; the column pass output, and hence the row pass inputs 4-7
+        (dotimes (i 8)
+          (setf (nth 1 (nth i p)) 0))
+        (loop for i from 4 below 8
+              do (setf (nth 0 (nth i q)) 0 (nth 1 (nth i q)) 0)))
       (labels ((columns (h body) ; block columns 4h..4h+3 -> P[row][h]
-                 `(llm-idct-1d (add sub mulc shl)
-                               ,(loop for row below 8 collect `(neon:s32.4-aref ,block ,(+ (* 8 row) (* 4 h))))
-                               ,raw
-                    (let ,(loop for row below 8 collect `(,(ref p row h) (descale ,(nth row raw) ,+shift-1+)))
-                      ,body)))
+                 (if (and sparse (= h 1))
+                     body ; all zero
+                     `(llm-idct-1d (add sub mulc shl (neon:s32.4-broadcast 0))
+                                   ,(loop for row below 8
+                                          collect (if (and sparse (>= row 4))
+                                                      0
+                                                      `(neon:s32.4-aref ,block ,(+ (* 8 row) (* 4 h)))))
+                                   ,raw
+                        (let ,(loop for row below 8 collect `(,(ref p row h) (descale ,(nth row raw) ,+shift-1+)))
+                          ,body))))
                (rows (g body) ; rows 4g..4g+3, Q[col][g] -> O[col][g]
-                 `(llm-idct-1d (add sub mulc shl)
+                 `(llm-idct-1d (add sub mulc shl (neon:s32.4-broadcast 0))
                                ,(loop for k below 8 collect (ref q k g))
                                ,raw
                     (let ,(loop for k below 8 collect `(,(ref o k g) (sample ,(nth k raw))))
                       ,body)))
                (transpose (src dst g h body) ; 4x4 tile src[4g+j][h] -> dst[4h+j][g]
-                 `(multiple-value-bind ,(loop for j below 4 collect (ref dst (+ (* 4 h) j) g))
-                      (transpose4 ,@(loop for j below 4 collect (ref src (+ (* 4 g) j) h)))
-                    ,body))
+                 (if (every (lambda (j) (eql (ref src (+ (* 4 g) j) h) 0)) '(0 1 2 3))
+                     body ; a zero tile stays zero (marked above)
+                     `(multiple-value-bind ,(loop for j below 4 collect (ref dst (+ (* 4 h) j) g))
+                          (transpose4 ,@(loop for j below 4 collect (ref src (+ (* 4 g) j) h)))
+                        ,body)))
                (transpose-all (src dst body)
                  (transpose src dst 0 0 (transpose src dst 0 1 (transpose src dst 1 0 (transpose src dst 1 1 body))))))
         `(macrolet ((add (a b) `(neon:s32.4+ ,a ,b))
@@ -1977,17 +2006,36 @@ quarter, a row pass and a transposition back."
                                         (setf (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,row ,stride)) -3)) a
                                               (sb-kernel:%vector-raw-bits ,plane (ash (plus ,pos (mul ,(1+ row) ,stride)) -3)) b))))))))))))))))
 
-(defun idct-block (block ws plane pos stride)
+(defun idct-block (block ws plane pos stride last)
   "Performs inverse LLM DCT on BLOCK (dequantized, natural order) and stores the
-samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart"
+samples, level shifted and clamped, in PLANE at POS, rows STRIDE apart. LAST is
+the zigzag index of the last nonzero coefficient: blocks with DC only are
+filled with a constant, and the NEON version has a cheaper variant for
+coefficients in the top left 4x4 corner (zigzag indices up to 9)."
   (declare #.*optimize*
            (type sint32-array block)
            (type fixnum-array ws)
            (type uint8-array plane)
-           (type fixnum pos stride)
-           #+cl-jpeg-neon (ignore ws))
-  #+cl-jpeg-neon (neon-idct-block block plane pos stride)
-  #-cl-jpeg-neon (idct-block-scalar block ws plane pos stride)
+           (type fixnum pos stride last)
+           #+cl-jpeg-neon (ignorable ws))
+  (cond ((zerop last)
+         ;; same result as the full transform of a DC-only block
+         (let ((s (plus 127 (descale (ash (aref block 0) 1) 4))))
+           (declare (type fixnum s))
+           (let ((sample (if (logtest s -256) (if (minusp s) 0 255) s)))
+             (declare (type uint8 sample))
+             #+sbcl
+             (let ((word (* sample #x0101010101010101)))
+               (dotimes (row 8)
+                 (setf (sb-kernel:%vector-raw-bits plane (ash (plus pos (mul row stride)) -3)) word)))
+             #-sbcl
+             (dotimes (row 8)
+               (fill plane sample :start (plus pos (mul row stride)) :end (plus pos (plus (mul row stride) 8)))))))
+        #+cl-jpeg-neon
+        ((<= last 9) (neon-idct-block block plane pos stride t))
+        (t
+         #+cl-jpeg-neon (neon-idct-block block plane pos stride)
+         #-cl-jpeg-neon (idct-block-scalar block ws plane pos stride)))
   nil)
 
 ;;; Scan geometry, shared by sequential and progressive decoding
@@ -2099,19 +2147,28 @@ marker that terminated the scan, or 0 if it ended cleanly."
         (block (descriptor-coefs image))
         (ws (descriptor-idct-ws image))
         (planes (descriptor-planes image))
-        (bpr (descriptor-blocks-per-row image)))
+        (bpr (descriptor-blocks-per-row image))
+        (natural +zigzag-natural+))
     (declare #.*optimize*
              (type simple-vector dc-tables ac-tables dequant planes bpr)
+             (type fixnum-array natural)
              (type (simple-array sint16 (*)) preds))
     (flet ((decode-one (sc c row col)
              (declare (type fixnum sc c row col))
              (let ((stride (mul 8 (the fixnum (svref bpr c)))))
                (declare (type fixnum stride))
-               (decode-block block (svref dc-tables sc) (svref ac-tables sc) (svref dequant sc)
-                             br image preds sc)
-               (idct-block block ws (svref planes c)
-                           (plus (mul (mul row 8) stride) (mul col 8)) stride))))
+               (let ((last (decode-block block (svref dc-tables sc) (svref ac-tables sc)
+                                         (svref dequant sc) br image preds sc)))
+                 (declare (type fixnum last))
+                 (idct-block block ws (svref planes c)
+                             (plus (mul (mul row 8) stride) (mul col 8)) stride last)
+                 ;; leave the block all zero for the next one
+                 (if (< last 16)
+                     (loop for k fixnum from 0 to last
+                           do (setf (aref block (aref natural k)) 0))
+                     (fill block 0))))))
       (declare (dynamic-extent #'decode-one))
+      (fill block 0) ; a marker may have interrupted the previous interval mid-block
       (catch 'marker
         (map-scan-blocks image scan comps (scan-x scan) (interval-end image scan total-units)
                          #'decode-one)
@@ -2358,12 +2415,14 @@ Returns the marker that terminated the scan, or 0 if it ended cleanly."
                  (type fixnum bpr bpc stride))
         (dotimes (row bpc)
           (dotimes (col bpr)
-            (let ((offset (mul 64 (plus (mul row bpr) col))))
-              (declare (type fixnum offset))
+            (let ((offset (mul 64 (plus (mul row bpr) col)))
+                  (last 0))
+              (declare (type fixnum offset last))
               (dotimes (k 64)
-                (setf (aref block (aref natural k))
-                      (mul (aref coef-buf (plus offset k)) (aref qz k))))
-              (idct-block block ws plane (plus (mul (mul row 8) stride) (mul col 8)) stride))))))))
+                (let ((coef (aref coef-buf (plus offset k))))
+                  (unless (zerop coef) (setf last k))
+                  (setf (aref block (aref natural k)) (mul coef (aref qz k)))))
+              (idct-block block ws plane (plus (mul (mul row 8) stride) (mul col 8)) stride last))))))))
 
 ;;; Progressive frame decoding subroutine
 (defun decode-progressive-frame (image buffer)
