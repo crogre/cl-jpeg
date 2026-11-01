@@ -283,3 +283,23 @@ Findings / follow-ups:
 - At 1/2-1/8, sequential decoding could skip storing coefficients the
   reduced IDCT does not read (it must still decode them).
 
+### 2026-11-01 — Level shift fix — done (`exp/5-combined`, 94d84ab)
+
+The 127/128 finding above is fixed: all decoder paths level shift by 128
+and center chroma on 128 (IDCT scalar/NEON/DC-only/reduced, color
+conversion, YCCK tables, the exported `inverse-llm-dct` limit table).
+`simd-check.lisp` on `exp/5-combined` uses the new centering (the copy
+on this branch still matches experiments 1-4).
+
+| vs djpeg, 354 test images | before | after |
+|---|---|---|
+| mean signed difference | -0.98 | **0.000** |
+| mean absolute difference | 0.99 | **0.057** |
+| worst pixel | 4 | 3 |
+| scaled 1/8, non-4:2:0 | exactly 1 everywhere | **0** |
+
+New finding: cl-jpeg's **encoder** has its own bias. A smooth test image
+encoded by cl-jpeg (q 95) decodes 0.59 levels dark on average with both
+djpeg and the fixed cl-jpeg decoder (the round trip was -1.57 before the
+decoder fix). Not investigated; separate from the decoder work.
+
