@@ -1,5 +1,8 @@
-;;; NEON SIMD through sb-simd is used where available (SBCL on ARM64)
-#+(and sbcl arm64)
+;;; NEON SIMD through sb-simd is used on SBCL/ARM64 when requested by pushing
+;;; :CL-JPEG-SIMD onto *FEATURES* before cl-jpeg is compiled (recompile with
+;;; (asdf:load-system :cl-jpeg :force t) after changing it). The default is
+;;; portable code only.
+#+(and sbcl arm64 cl-jpeg-simd)
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (when (and (ignore-errors (require :sb-simd) t)
              (find-package "SB-SIMD-NEON"))
