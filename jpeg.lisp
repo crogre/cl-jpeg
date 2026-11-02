@@ -2782,11 +2782,16 @@ RSTn markers between intervals."
                    ;; (unless the bit reader already has)
                    (when (and (plusp ri) (zerop (mod (scan-x scan) ri))
                               (< (scan-x scan) (scan-cursor-total-units cursor)))
-                     (unless (eq (bitreader-marker (scan-cursor-br cursor)) 'restart)
-                       (let ((marker (read-marker image)))
-                         (unless (<= +M_RST0+ marker +M_RST7+)
-                           (setf (scan-cursor-done cursor) t
-                                 (scan-cursor-marker cursor) marker))))
+                     (let ((seen (bitreader-marker (scan-cursor-br cursor))))
+                       (cond ((eq seen 'restart)) ; RSTn already consumed
+                             (seen ; another marker: the scan's data has ended
+                              (setf (scan-cursor-done cursor) t
+                                    (scan-cursor-marker cursor) seen))
+                             (t
+                              (let ((marker (read-marker image)))
+                                (unless (<= +M_RST0+ marker +M_RST7+)
+                                  (setf (scan-cursor-done cursor) t
+                                        (scan-cursor-marker cursor) marker))))))
                      (reset-cursor cursor)))
                   ((and (eq result 'restart) (plusp ri))
                    ;; RSTn met early (corrupt data): resync at the next interval
