@@ -344,3 +344,48 @@ Current state (`exp/5-combined`, 2048x2048 unless noted):
 
 Remaining open item: the encoder bias (above).
 
+### 2026-11-02 — Review fixes — done (`exp/5-combined`, c0a188c..2bf4e3a)
+
+An independent review (subagent; artifacts in `bench/results/review/`,
+gitignored) found the branch much safer than upstream under fuzzing (13
+memory-fault crashes vs 416 on 3000 corrupt files) but not safe: 5 out-of-
+bounds bugs (4 pre-existing upstream, 1 new), plus dead code, duplication,
+SBCL-internal APIs, sb-simd loaded unconditionally, no test system, stale
+README. Fixed:
+
+- **Validation** (c0a188c): SOF/DQT/DHT/SOS values checked before use,
+  signalling the new `invalid-jpeg-data`; YCCK conversion only for 4
+  components; 16-bit coefficient stores wrapped explicitly.
+- **Cleanup** (ece7f6f, befa937): dead bit reader functions and slots
+  removed; one clamp macro, one `neon-transpose4`, `store-8-bytes` /
+  `load-8-bytes` around `%vector-raw-bits`; no macro-time `intern`;
+  Huffman table slots named for what they hold; one restart
+  implementation (`advance-cursor`) for sequential and progressive scans;
+  `descriptor-byte-reader` honoured again; `truncated-jpeg-data`.
+- **NEON opt-in** (1a58478): only with `:cl-jpeg-simd` on `*features*`;
+  default build portable, byte-identical output.
+- **Tests** (3852989): `(asdf:test-system :cl-jpeg)`, ~200 KB fixtures,
+  includes the review's crash cases and 520 corrupted files; verified to
+  fail when the YCCK or spectral range checks are disabled.
+- **Docs** (d3d9eb8): README and ChangeLog, version 2.9.
+- **Marker fix** (2bf4e3a): found by re-fuzzing after the restart
+  unification: a marker read ahead at an interval end was read past.
+
+Fuzzing the final code (the review's 3000 cases, in-memory, file stream,
+1/2, 1/8 and row callback modes):
+
+| build | OK | decoder errors | crashes | hangs |
+|---|---|---|---|---|
+| upstream cd92e94 (review) | 1161 | 1417 | 416 | 6 |
+| exp/5 before fixes (review) | 1386 | 1600 | 13 (+2 other modes) | 1 |
+| final, shipped (safety 0) | 1239 | 1761 | **0** | **0** |
+| final, safety-1 oracle | 1239 | 1761 | 0 | 0 |
+
+The safety-1 build raises only decoder conditions (no bounds or type
+errors), and agrees case by case with the shipped build.
+
+Speed, 2048x2048 vs stb_image (scalar default / NEON opt-in): base420
+1.66x / 0.78x, base444 1.55x / 0.95x, gray 1.49x / 0.96x, prog420
+1.39x / 0.97x. Restart unification cost ~1.7% on progressive; validation
+and cleanup nothing measurable.
+
