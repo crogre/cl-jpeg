@@ -1,3 +1,41 @@
+2026-11-02  Greger Cronquist  <greger@zero-gravity.se>
+
+	* Version 2.9
+
+	* Added progressive JPEG decoding (SOF2), with restart intervals
+
+	* Added :SCALE (1/2, 1/4, 1/8) to DECODE-IMAGE and DECODE-STREAM,
+	using reduced inverse DCTs; progressive scans of unneeded frequencies
+	are skipped
+
+	* Added :ROW-CALLBACK to DECODE-IMAGE and DECODE-STREAM, to receive
+	rows instead of an image array
+
+	* The decoder decodes one row of MCUs at a time: memory use is the
+	output image plus a few hundred kilobytes, progressive images included
+
+	* Decoding is several times faster: buffered 64-bit bit reader with
+	Huffman lookahead tables, IDCT writing into component planes with
+	sparse and DC-only cases, fused upsampling and color conversion, file
+	streams read in chunks
+
+	* Optional NEON SIMD on SBCL/ARM64 (push :CL-JPEG-SIMD onto *FEATURES*)
+
+	* Header values are validated before use; invalid data signals
+	INVALID-JPEG-DATA, truncated data TRUNCATED-JPEG-DATA. Fixed buffer
+	overflows on malformed files (YCCK marker on non-CMYK images, Huffman
+	tables with too many codes, out-of-range progressive scan parameters,
+	undefined Huffman tables)
+
+	* Fixed sequential images with one scan per subsampled component,
+	DC Huffman table selection, and images with more than four scans
+
+	* Decoded samples are level shifted by 128 instead of 127
+
+	* DESCRIPTOR-BYTE-READER, when set, supplies the input bytes
+
+	* Added a test system: (asdf:test-system :cl-jpeg)
+
 2017-02-17  Eugene Zaikonnikov  <eugene@funcall.org>
 
 	* Added :CACHED-SOURCE-P option to decoder allowing to read-sequence the image at once
